@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -20,11 +21,7 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
             continue;
         }
         s.push('\n');
-        s.push_str(&format!(
-            "[{}]  {}\n",
-            section_name,
-            fmt_size(section_total)
-        ));
+        let _ = writeln!(s, "[{}]  {}", section_name, fmt_size(section_total));
 
         for cat in *cats {
             let dirs = result.dirs_by_category(*cat);
@@ -38,19 +35,21 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
                 ""
             };
             s.push('\n');
-            s.push_str(&format!(
-                "  {}  {}{}\n",
+            let _ = writeln!(
+                s,
+                "  {}  {}{}",
                 cat.label(),
                 fmt_size(cat_total),
                 safe_label
-            ));
+            );
             for dir in &dirs {
-                s.push_str(&format!(
-                    "    {:>10}  {}  ({})\n",
+                let _ = writeln!(
+                    s,
+                    "    {:>10}  {}  ({})",
                     fmt_size(dir.size),
                     display_path(&dir.path, home),
                     fmt_age(dir.last_modified)
-                ));
+                );
             }
         }
     }
@@ -62,16 +61,16 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
         for d in &result.large_unknown_dirs {
             let stale = SystemTime::now()
                 .duration_since(d.last_modified)
-                .map(|a| a >= stale_threshold)
-                .unwrap_or(false);
+                .is_ok_and(|a| a >= stale_threshold);
             let stale_tag = if stale { "  [stale]" } else { "" };
-            s.push_str(&format!(
-                "\n  {}  {}  (last used: {}){}\n",
+            let _ = writeln!(
+                s,
+                "\n  {}  {}  (last used: {}){}",
                 fmt_size(d.size),
                 display_path(&d.path, home),
                 fmt_age(d.last_modified),
                 stale_tag
-            ));
+            );
             write_children(&mut s, &d.notable_children);
         }
     }
@@ -97,15 +96,17 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
     s.push('\n');
     s.push_str(&"=".repeat(60));
     s.push('\n');
-    s.push_str(&format!(
-        "TOTAL RECLAIMABLE (dirs + disk images):  {}\n",
+    let _ = writeln!(
+        s,
+        "TOTAL RECLAIMABLE (dirs + disk images):  {}",
         fmt_size(result.grand_total())
-    ));
+    );
     if result.permission_errors > 0 {
-        s.push_str(&format!(
-            "note: {} directories skipped due to permission errors\n",
+        let _ = writeln!(
+            s,
+            "note: {} directories skipped due to permission errors",
             result.permission_errors
-        ));
+        );
     }
 
     let mut f = fs::File::create(path)?;
@@ -115,22 +116,19 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
 
 fn write_files(s: &mut String, files: &[FoundFile], home: &Path) {
     for f in files {
-        s.push_str(&format!(
-            "    {:>10}  {}  ({})\n",
+        let _ = writeln!(
+            s,
+            "    {:>10}  {}  ({})",
             fmt_size(f.size),
             display_path(&f.path, home),
             fmt_age(f.modified)
-        ));
+        );
     }
 }
 
 fn write_children(s: &mut String, children: &[(PathBuf, u64)]) {
     for (child, child_size) in children {
         let child_name = child.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        s.push_str(&format!(
-            "    {:>10}  {}\n",
-            fmt_size(*child_size),
-            child_name
-        ));
+        let _ = writeln!(s, "    {:>10}  {}", fmt_size(*child_size), child_name);
     }
 }

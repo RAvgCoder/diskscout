@@ -35,7 +35,7 @@ pub struct BootstrapArgs {
     pub debug: bool,
 }
 
-pub fn run(args: BootstrapArgs) -> Result<(), String> {
+pub fn run(args: &BootstrapArgs) -> Result<(), String> {
     println!("{}", "diskscout __bootstrap".bold());
     println!();
 
@@ -136,9 +136,7 @@ fn scan(dir: &Path, depth: u32, max: u32, hits: &mut Vec<PathBuf>) {
 
 fn is_diskscout_workspace(path: &Path) -> bool {
     let manifest = path.join("Cargo.toml");
-    std::fs::read_to_string(manifest)
-        .map(|s| s.contains("name = \"diskscout\""))
-        .unwrap_or(false)
+    std::fs::read_to_string(manifest).is_ok_and(|s| s.contains("name = \"diskscout\""))
 }
 
 // ---------------------------------------------------------------------------
@@ -341,8 +339,7 @@ fn home_dir() -> Result<PathBuf, String> {
 fn expand_tilde(s: &str) -> PathBuf {
     match s.strip_prefix("~/") {
         Some(rest) => std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(rest))
-            .unwrap_or_else(|| PathBuf::from(s)),
+            .map_or_else(|| PathBuf::from(s), |h| PathBuf::from(h).join(rest)),
         None => PathBuf::from(s),
     }
 }

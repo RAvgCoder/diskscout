@@ -64,7 +64,7 @@ struct ScanArgs {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(Command::Bootstrap(args)) = cli.command {
+    if let Some(Command::Bootstrap(args)) = &cli.command {
         if let Err(e) = bootstrap::run(args) {
             eprintln!("{e}");
             std::process::exit(1);

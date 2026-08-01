@@ -82,7 +82,7 @@ pub fn print_report(result: &ScanResult, home: &Path) {
                     "      {:>10}  {}  {}",
                     fmt_size(dir.size).green(),
                     display_path(&dir.path, home).dimmed(),
-                    format!("({})", age).dimmed()
+                    format!("({age})").dimmed()
                 );
             }
             if dirs.len() > 8 {
@@ -163,8 +163,7 @@ fn print_unknown_dirs(dirs: &[LargeDir], home: &Path) {
         let age = fmt_age(d.last_modified);
         let stale = SystemTime::now()
             .duration_since(d.last_modified)
-            .map(|a| a >= stale_threshold)
-            .unwrap_or(false);
+            .is_ok_and(|a| a >= stale_threshold);
 
         let stale_tag = if stale {
             format!("  {}", "[stale]".red())
@@ -176,7 +175,7 @@ fn print_unknown_dirs(dirs: &[LargeDir], home: &Path) {
             "    {}  {}  {}{}",
             fmt_size(d.size).bold().green(),
             display_path(&d.path, home).cyan(),
-            format!("(last used: {})", age).dimmed(),
+            format!("(last used: {age})").dimmed(),
             stale_tag
         );
 

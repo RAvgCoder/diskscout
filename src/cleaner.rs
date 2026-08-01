@@ -129,7 +129,7 @@ pub fn interactive_delete(result: &ScanResult, home: &Path) {
 }
 
 fn confirm(prompt: &str) -> bool {
-    print!("{}", prompt);
+    print!("{prompt}");
     io::stdout().flush().unwrap();
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();

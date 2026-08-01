@@ -542,7 +542,7 @@ pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
     for entry in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         if entry.file_type().is_file()
             && let Ok(meta) = entry.metadata()
@@ -566,7 +566,7 @@ pub fn fmt_size(bytes: u64) -> String {
     } else if bytes >= 1_024 {
         format!("{:.0} KB", bytes as f64 / 1_024.0)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -575,7 +575,7 @@ pub fn fmt_age(modified: SystemTime) -> String {
         Ok(age) => {
             let days = age.as_secs() / 86_400;
             if days < 7 {
-                format!("{} days", days)
+                format!("{days} days")
             } else if days < 30 {
                 format!("{} weeks", days / 7)
             } else if days < 365 {
@@ -593,5 +593,185 @@ pub fn display_path(path: &Path, home: &Path) -> String {
         Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
         Ok(rel) => format!("~/{}", rel.display()),
         Err(_) => path.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn classify(root: &Path, name: &str) -> Option<Category> {
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .find(|e| e.file_type().is_dir() && e.file_name() == name)
+            .and_then(|e| classify_dir(&e))
+    }
+
+    #[test]
+    fn fmt_size_picks_the_largest_fitting_unit() {
+        assert_eq!(fmt_size(0), "0 B");
+        assert_eq!(fmt_size(1_023), "1023 B");
+        assert_eq!(fmt_size(1_024), "1 KB");
+        assert_eq!(fmt_size(1_048_576), "1 MB");
+        assert_eq!(fmt_size(1_073_741_824), "1.0 GB");
+        assert_eq!(fmt_size(3_221_225_472), "3.0 GB");
+    }
+
+    #[test]
+    fn fmt_age_scales_from_days_to_years() {
+        let ago = |secs| SystemTime::now() - Duration::from_secs(secs);
+        assert_eq!(fmt_age(ago(0)), "0 days");
+        assert_eq!(fmt_age(ago(6 * 86_400)), "6 days");
+        assert_eq!(fmt_age(ago(14 * 86_400)), "2 weeks");
+        assert_eq!(fmt_age(ago(60 * 86_400)), "2 months");
+        assert_eq!(fmt_age(ago(730 * 86_400)), "2.0 years");
+    }
+
+    #[test]
+    fn fmt_age_reports_future_timestamps_as_unknown() {
+        assert_eq!(
+            fmt_age(SystemTime::now() + Duration::from_secs(86_400)),
+            "unknown age"
+        );
+    }
+
+    #[test]
+    fn display_path_abbreviates_home() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(display_path(home, home), "~");
+        assert_eq!(
+            display_path(&home.join("Developer/x"), home),
+            "~/Developer/x"
+        );
+        assert_eq!(
+            display_path(Path::new("/opt/homebrew"), home),
+            "/opt/homebrew"
+        );
+    }
+
+    #[test]
+    fn target_counts_only_beside_a_cargo_manifest() {
+        let td = tempdir().unwrap();
+        let crate_dir = td.path().join("mycrate");
+        fs::create_dir_all(crate_dir.join("target")).unwrap();
+        fs::write(crate_dir.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(classify(td.path(), "target"), Some(Category::RustTarget));
+
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("somewhere/target")).unwrap();
+        assert_eq!(classify(td2.path(), "target"), None);
+    }
+
+    #[test]
+    fn node_modules_and_pycache_need_no_marker_file() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(td.path().join("app/node_modules")).unwrap();
+        fs::create_dir_all(td.path().join("app/__pycache__")).unwrap();
+        assert_eq!(
+            classify(td.path(), "node_modules"),
+            Some(Category::NodeModules)
+        );
+        assert_eq!(
+            classify(td.path(), "__pycache__"),
+            Some(Category::PythonBytecode)
+        );
+    }
+
+    #[test]
+    fn venv_counts_only_beside_a_python_project_marker() {
+        let td = tempdir().unwrap();
+        let proj = td.path().join("proj");
+        fs::create_dir_all(proj.join(".venv")).unwrap();
+        fs::write(proj.join("pyproject.toml"), "").unwrap();
+        assert_eq!(classify(td.path(), ".venv"), Some(Category::PythonEnv));
+
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("notaproject/.venv")).unwrap();
+        assert_eq!(classify(td2.path(), ".venv"), None);
+    }
+
+    #[test]
+    fn pods_counts_only_beside_a_podfile() {
+        let td = tempdir().unwrap();
+        let app = td.path().join("App");
+        fs::create_dir_all(app.join("Pods")).unwrap();
+        fs::write(app.join("Podfile"), "").unwrap();
+        assert_eq!(classify(td.path(), "Pods"), Some(Category::CocoaPods));
+
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("x/Pods")).unwrap();
+        assert_eq!(classify(td2.path(), "Pods"), None);
+    }
+
+    #[test]
+    fn only_regenerable_categories_are_marked_safe() {
+        assert!(Category::RustTarget.safe_to_delete());
+        assert!(Category::NodeModules.safe_to_delete());
+        assert!(Category::UvCache.safe_to_delete());
+        assert!(!Category::IphoneBackups.safe_to_delete());
+        assert!(!Category::IosSimulators.safe_to_delete());
+        assert!(!Category::PythonEnv.safe_to_delete());
+    }
+
+    #[test]
+    fn dir_stats_sums_nested_files() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(td.path().join("a/b")).unwrap();
+        fs::write(td.path().join("a/one.bin"), vec![0u8; 100]).unwrap();
+        fs::write(td.path().join("a/b/two.bin"), vec![0u8; 250]).unwrap();
+        let (size, newest) = dir_stats(td.path());
+        assert_eq!(size, 350);
+        assert!(newest > SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn dir_stats_on_an_empty_dir_is_zero() {
+        let td = tempdir().unwrap();
+        let (size, newest) = dir_stats(td.path());
+        assert_eq!(size, 0);
+        assert_eq!(newest, SystemTime::UNIX_EPOCH);
+    }
+
+    fn found(path: &str, category: Category, size: u64) -> FoundDir {
+        FoundDir {
+            path: PathBuf::from(path),
+            category,
+            size,
+            last_modified: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn dirs_by_category_filters_and_sorts_largest_first() {
+        let result = ScanResult {
+            dirs: vec![
+                found("/a", Category::RustTarget, 10),
+                found("/b", Category::NodeModules, 999),
+                found("/c", Category::RustTarget, 500),
+            ],
+            ..ScanResult::default()
+        };
+        let targets = result.dirs_by_category(Category::RustTarget);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].size, 500);
+        assert_eq!(targets[1].size, 10);
+        assert_eq!(result.category_total(Category::RustTarget), 510);
+    }
+
+    #[test]
+    fn grand_total_counts_dirs_and_disk_images() {
+        let result = ScanResult {
+            dirs: vec![found("/a", Category::RustTarget, 100)],
+            disk_images: vec![FoundFile {
+                path: PathBuf::from("/x.dmg"),
+                size: 25,
+                modified: SystemTime::UNIX_EPOCH,
+            }],
+            ..ScanResult::default()
+        };
+        assert_eq!(result.grand_total(), 125);
     }
 }

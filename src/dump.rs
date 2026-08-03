@@ -89,8 +89,17 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
 
     if !result.disk_images.is_empty() {
         s.push('\n');
-        s.push_str("[DISK IMAGES]  (.dmg / .iso / .pkg) -- forgotten installers\n");
+        s.push_str("[DISK IMAGES & INSTALLERS]  forgotten installers and VM images\n");
         write_files(&mut s, &result.disk_images, home);
+    }
+
+    if !result.reserved_files.is_empty() {
+        s.push('\n');
+        s.push_str("[RESERVED SYSTEM FILES]  (not deletable directly)\n");
+        for f in &result.reserved_files {
+            let _ = writeln!(s, "    {:>10}  {}", fmt_size(f.size), f.path.display());
+            let _ = writeln!(s, "                {}", f.hint);
+        }
     }
 
     s.push('\n');

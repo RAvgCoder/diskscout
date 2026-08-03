@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::scanner::{Category, FoundFile, LargeDir, ScanResult, display_path, fmt_age, fmt_size};
 
+// Sections whose categories are all empty are skipped when printing, so the
+// macOS and Windows blocks can both live here unconditionally.
 pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
     (
         "BUILD ARTIFACTS",
@@ -16,6 +18,9 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
             Category::Nuxt,
             Category::SvelteKit,
             Category::CocoaPods,
+            Category::DotNetBuild,
+            Category::VisualStudioCache,
+            Category::GradleBuild,
         ],
     ),
     (
@@ -28,14 +33,48 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
         ],
     ),
     (
-        "PACKAGE CACHES",
+        "WINDOWS SYSTEM",
         &[
-            Category::NpmCache,
-            Category::HomebrewCache,
-            Category::UvCache,
+            Category::WindowsTemp,
+            Category::WindowsUpdate,
+            Category::WindowsOld,
+            Category::RecycleBin,
+            Category::CrashDumps,
+            Category::WindowsCaches,
+            Category::ThumbnailCache,
+            Category::InstallerCache,
+            Category::BrowserCache,
         ],
     ),
+    (
+        "PACKAGE & TOOL CACHES",
+        &[
+            Category::NpmCache,
+            Category::YarnPnpmCache,
+            Category::HomebrewCache,
+            Category::UvCache,
+            Category::PipCache,
+            Category::NugetCache,
+            Category::CargoRegistry,
+            Category::GradleCache,
+            Category::MavenCache,
+            Category::GoModCache,
+            Category::IdeCache,
+        ],
+    ),
+    (
+        "VMS, SDKS & CONTAINERS",
+        &[Category::DockerData, Category::AndroidSdk],
+    ),
 ];
+
+/// Every category the report knows about, in display order -- the single list
+/// the interactive cleaner walks so the two can never drift apart.
+pub(crate) fn all_categories() -> impl Iterator<Item = Category> {
+    SECTION_CATS
+        .iter()
+        .flat_map(|(_, cats)| cats.iter().copied())
+}
 
 const STALE_DAYS: u64 = 180;
 
@@ -116,10 +155,26 @@ pub fn print_report(result: &ScanResult, home: &Path) {
     if !result.disk_images.is_empty() {
         println!();
         println!(
-            "  {}  (forgotten installers)",
-            "DISK IMAGES (.dmg / .iso / .pkg)".bold().yellow()
+            "  {}  (forgotten installers and VM images)",
+            "DISK IMAGES & INSTALLERS".bold().yellow()
         );
         print_files(&result.disk_images, home, 20);
+    }
+
+    if !result.reserved_files.is_empty() {
+        println!();
+        println!(
+            "  {}  (not deletable directly)",
+            "RESERVED SYSTEM FILES".bold().yellow()
+        );
+        for f in &result.reserved_files {
+            println!(
+                "      {:>10}  {}",
+                fmt_size(f.size).green(),
+                f.path.display().to_string().dimmed()
+            );
+            println!("                  {}", f.hint.dimmed());
+        }
     }
 
     println!();
@@ -147,6 +202,9 @@ pub fn print_report(result: &ScanResult, home: &Path) {
         "{}",
         "  Run with --delete-targets to nuke all Rust target/ dirs immediately.".dimmed()
     );
+    for hint in crate::platform::extra_hints() {
+        println!("{}", format!("  {hint}").dimmed());
+    }
     println!();
 }
 

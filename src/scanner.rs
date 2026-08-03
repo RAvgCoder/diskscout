@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::platform;
+
 struct FileLimits {
     large: u64,
     old_after: Duration,
@@ -14,6 +16,7 @@ struct FileLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Category {
+    // Build artifacts, found by pattern during the walk.
     RustTarget,
     NodeModules,
     PythonBytecode,
@@ -22,13 +25,39 @@ pub enum Category {
     Nuxt,
     SvelteKit,
     CocoaPods,
+    DotNetBuild,
+    VisualStudioCache,
+    GradleBuild,
+    // macOS system directories.
     XcodeDerivedData,
     IosSimulators,
     MacOsCaches,
     IphoneBackups,
+    // Windows system directories.
+    WindowsTemp,
+    WindowsUpdate,
+    WindowsOld,
+    RecycleBin,
+    CrashDumps,
+    WindowsCaches,
+    ThumbnailCache,
+    InstallerCache,
+    BrowserCache,
+    // Package and tool caches.
     NpmCache,
+    YarnPnpmCache,
     HomebrewCache,
     UvCache,
+    PipCache,
+    NugetCache,
+    CargoRegistry,
+    GradleCache,
+    MavenCache,
+    GoModCache,
+    IdeCache,
+    // Large payloads that hold real state.
+    DockerData,
+    AndroidSdk,
 }
 
 impl Category {
@@ -42,25 +71,96 @@ impl Category {
             Category::Nuxt => "Nuxt .nuxt/",
             Category::SvelteKit => "SvelteKit .svelte-kit/",
             Category::CocoaPods => "CocoaPods Pods/",
+            Category::DotNetBuild => ".NET bin/ + obj/",
+            Category::VisualStudioCache => "Visual Studio .vs/",
+            Category::GradleBuild => "Gradle build/",
             Category::XcodeDerivedData => "Xcode DerivedData",
             Category::IosSimulators => "iOS Simulators",
             Category::MacOsCaches => "macOS Caches",
             Category::IphoneBackups => "iPhone Backups",
+            Category::WindowsTemp => "Temp files",
+            Category::WindowsUpdate => "Windows Update cache",
+            Category::WindowsOld => "Previous Windows install",
+            Category::RecycleBin => "Recycle Bin",
+            Category::CrashDumps => "Crash dumps & error reports",
+            Category::WindowsCaches => "Windows caches",
+            Category::ThumbnailCache => "Thumbnail & icon cache",
+            Category::InstallerCache => "Installer payload cache",
+            Category::BrowserCache => "Browser caches",
             Category::NpmCache => "npm cache",
+            Category::YarnPnpmCache => "yarn / pnpm store",
             Category::HomebrewCache => "Homebrew cache",
             Category::UvCache => "uv cache",
+            Category::PipCache => "pip cache",
+            Category::NugetCache => "NuGet packages",
+            Category::CargoRegistry => "Cargo registry",
+            Category::GradleCache => "Gradle cache",
+            Category::MavenCache => "Maven repository",
+            Category::GoModCache => "Go module cache",
+            Category::IdeCache => "IDE caches",
+            Category::DockerData => "Docker / WSL data",
+            Category::AndroidSdk => "Android SDK & emulators",
         }
     }
 
+    /// Regenerable on demand: deleting costs a re-download or a rebuild, never
+    /// data. Everything else is reported but flagged for review.
     pub fn safe_to_delete(self) -> bool {
         matches!(
             self,
             Category::RustTarget
                 | Category::NodeModules
                 | Category::PythonBytecode
+                | Category::DotNetBuild
+                | Category::VisualStudioCache
+                | Category::GradleBuild
+                | Category::WindowsTemp
+                | Category::WindowsUpdate
+                | Category::RecycleBin
+                | Category::CrashDumps
+                | Category::WindowsCaches
+                | Category::ThumbnailCache
+                | Category::BrowserCache
                 | Category::NpmCache
+                | Category::YarnPnpmCache
                 | Category::HomebrewCache
                 | Category::UvCache
+                | Category::PipCache
+                | Category::NugetCache
+                | Category::CargoRegistry
+                | Category::GradleCache
+                | Category::MavenCache
+                | Category::GoModCache
+                | Category::IdeCache
+        )
+    }
+
+    /// CLI-facing name, derived from the label so the two cannot drift apart.
+    /// "Browser caches" becomes "browser-caches".
+    pub fn slug(self) -> String {
+        let mut out = String::new();
+        for ch in self.label().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+            } else if !out.ends_with('-') {
+                out.push('-');
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    /// Live directories the OS and running apps expect to keep existing: empty
+    /// them instead of removing the folder itself.
+    pub fn delete_contents_only(self) -> bool {
+        matches!(
+            self,
+            Category::WindowsTemp
+                | Category::WindowsUpdate
+                | Category::RecycleBin
+                | Category::CrashDumps
+                | Category::WindowsCaches
+                | Category::ThumbnailCache
+                | Category::BrowserCache
         )
     }
 }
@@ -98,6 +198,15 @@ pub struct LargeDir {
     pub notable_children: Vec<(PathBuf, u64)>,
 }
 
+// An OS-reserved file that cannot be deleted directly, carried with the
+// command that does reclaim it.
+#[derive(Debug)]
+pub struct ReservedFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub hint: &'static str,
+}
+
 #[derive(Debug, Default)]
 pub struct ScanResult {
     pub dirs: Vec<FoundDir>,
@@ -105,6 +214,7 @@ pub struct ScanResult {
     pub old_files: Vec<FoundFile>,
     pub disk_images: Vec<FoundFile>,
     pub large_unknown_dirs: Vec<LargeDir>,
+    pub reserved_files: Vec<ReservedFile>,
     pub permission_errors: usize,
 }
 
@@ -139,16 +249,18 @@ impl Scanner {
         Self { config }
     }
 
+    // The fixed OS targets are sized directly, so the walker skips them: it
+    // avoids both double-counting and a long crawl through cache trees.
     fn skip_paths(&self) -> Vec<PathBuf> {
-        vec![
-            PathBuf::from("/System"),
-            PathBuf::from("/private"),
-            PathBuf::from("/dev"),
-            PathBuf::from("/Volumes"),
-            PathBuf::from("/proc"),
-            self.config.home.join("Library"),
-            self.config.home.join(".Trash"),
-        ]
+        let mut skip = platform::skip_paths(&self.config.home);
+        if self.config.include_system {
+            skip.extend(
+                platform::system_targets(&self.config.home)
+                    .into_iter()
+                    .map(|(path, _)| path),
+            );
+        }
+        skip
     }
 
     pub fn scan(&self) -> ScanResult {
@@ -227,18 +339,14 @@ impl Scanner {
         spinner.finish_and_clear();
 
         if self.config.include_system {
-            pending.extend(self.fixed_macos_paths());
+            pending.extend(platform::system_targets(&self.config.home));
         }
+        pending.extend(platform::build_cache_targets(&self.config.home));
 
-        // Check both the persistent build cache location and the legacy /tmp path.
-        for cargo_target in [
-            self.config.home.join(".build_caches/cargo"),
-            PathBuf::from("/tmp/cargo-target"),
-        ] {
-            if cargo_target.exists() {
-                pending.push((cargo_target, Category::RustTarget));
-            }
-        }
+        // Two targets can resolve to the same directory (%TEMP% under a
+        // relocated profile, say); sizing it twice would inflate the total.
+        pending.sort_by(|a, b| a.0.cmp(&b.0));
+        pending.dedup_by(|a, b| a.0 == b.0);
 
         eprintln!("Found {} directories -- computing sizes...", pending.len());
 
@@ -265,6 +373,9 @@ impl Scanner {
 
         pb.finish_and_clear();
 
+        // An empty target is either genuinely empty or unreadable without
+        // elevation; either way there is nothing to report.
+        dirs.retain(|d| d.size > 0);
         dirs.sort_by_key(|d| Reverse(d.size));
 
         large_files.sort_by_key(|f| Reverse(f.size));
@@ -285,6 +396,7 @@ impl Scanner {
             old_files,
             disk_images,
             large_unknown_dirs,
+            reserved_files: reserved_files(),
             permission_errors: err_count.load(Ordering::Relaxed),
         }
     }
@@ -411,12 +523,15 @@ impl Scanner {
         let Ok(meta) = entry.metadata() else {
             return;
         };
-        let size = meta.len();
+        if platform::occupies_no_local_space(&meta) {
+            return;
+        }
+        let size = platform::size_on_disk(entry.path(), &meta);
         let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let path = entry.path().to_owned();
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && matches!(ext.to_lowercase().as_str(), "dmg" | "iso" | "pkg")
+            && platform::is_disk_image(&ext.to_lowercase())
             && size > 1_048_576
         {
             images.push(FoundFile {
@@ -445,55 +560,16 @@ impl Scanner {
             });
         }
     }
+}
 
-    fn fixed_macos_paths(&self) -> Vec<(PathBuf, Category)> {
-        let h = &self.config.home;
-        let mut out = Vec::new();
-
-        let candidates = [
-            // Resolve symlink so ~/.build_caches/xcode and the DerivedData symlink
-            // don't both end up in the list and get double-counted.
-            (
-                std::fs::canonicalize(h.join("Library/Developer/Xcode/DerivedData"))
-                    .unwrap_or_else(|_| h.join("Library/Developer/Xcode/DerivedData")),
-                Category::XcodeDerivedData,
-            ),
-            (
-                h.join("Library/Developer/CoreSimulator/Devices"),
-                Category::IosSimulators,
-            ),
-            (h.join("Library/Caches"), Category::MacOsCaches),
-            (
-                h.join("Library/Application Support/MobileSync/Backup"),
-                Category::IphoneBackups,
-            ),
-            (h.join(".npm/_cacache"), Category::NpmCache),
-            (h.join(".cache/uv"), Category::UvCache),
-            (h.join("Library/Caches/uv"), Category::UvCache),
-            (h.join(".cache/pip"), Category::UvCache),
-        ];
-
-        for (path, cat) in candidates {
-            if path.exists() {
-                out.push((path, cat));
-            }
-        }
-
-        if let Ok(out_bytes) = std::process::Command::new("brew").arg("--cache").output()
-            && out_bytes.status.success()
-        {
-            let brew_path = PathBuf::from(
-                String::from_utf8_lossy(&out_bytes.stdout)
-                    .trim()
-                    .to_string(),
-            );
-            if brew_path.exists() {
-                out.push((brew_path, Category::HomebrewCache));
-            }
-        }
-
-        out
-    }
+fn reserved_files() -> Vec<ReservedFile> {
+    platform::reserved_system_files()
+        .into_iter()
+        .filter_map(|(path, hint)| {
+            let size = std::fs::metadata(&path).ok()?.len();
+            Some(ReservedFile { path, size, hint })
+        })
+        .collect()
 }
 
 fn classify_dir(entry: &DirEntry) -> Option<Category> {
@@ -508,7 +584,13 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
                 None
             }
         }
-        "node_modules" => Some(Category::NodeModules),
+        "node_modules" => {
+            if is_packaged_app(entry.path()) {
+                None
+            } else {
+                Some(Category::NodeModules)
+            }
+        }
         "__pycache__" => Some(Category::PythonBytecode),
         ".venv" | "venv" | "env" => {
             if parent.join("pyproject.toml").exists()
@@ -531,8 +613,60 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
                 None
             }
         }
+        // "bin" and "obj" are common enough names that they only count next to
+        // a project file that explains them.
+        "bin" | "obj" => {
+            if has_sibling_ext(parent, &["csproj", "vbproj", "fsproj", "vcxproj", "sln"]) {
+                Some(Category::DotNetBuild)
+            } else {
+                None
+            }
+        }
+        ".vs" => Some(Category::VisualStudioCache),
+        "build" => {
+            if parent.join("build.gradle").exists() || parent.join("build.gradle.kts").exists() {
+                Some(Category::GradleBuild)
+            } else {
+                None
+            }
+        }
+        "packages" => {
+            if has_sibling_ext(parent, &["sln"]) {
+                Some(Category::NugetCache)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
+}
+
+// An Electron app ships its dependencies inside its own install directory, so
+// the tree looks exactly like a project's `node_modules` -- but deleting it
+// breaks the installed application rather than freeing a rebuildable cache.
+fn is_packaged_app(path: &Path) -> bool {
+    let mut components = path.iter().rev().skip(1); // skip "node_modules"
+    let parent = components.next().and_then(|c| c.to_str());
+    if matches!(parent, Some("app.asar.unpacked")) {
+        return true;
+    }
+    // .../resources/app/node_modules and .../resources/node_modules
+    let grandparent = components.next().and_then(|c| c.to_str());
+    matches!(parent, Some("resources"))
+        || (matches!(parent, Some("app")) && matches!(grandparent, Some("resources")))
+}
+
+// Whether `dir` directly contains a file with any of these extensions.
+fn has_sibling_ext(dir: &Path, exts: &[&str]) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| exts.iter().any(|want| x.eq_ignore_ascii_case(want)))
+    })
 }
 
 // Computes total size and most-recent modification time in a single walk.
@@ -546,8 +680,9 @@ pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
     {
         if entry.file_type().is_file()
             && let Ok(meta) = entry.metadata()
+            && !platform::occupies_no_local_space(&meta)
         {
-            size += meta.len();
+            size += platform::size_on_disk(entry.path(), &meta);
             if let Ok(modified) = meta.modified()
                 && modified > newest
             {
@@ -591,7 +726,7 @@ pub fn fmt_age(modified: SystemTime) -> String {
 pub fn display_path(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
-        Ok(rel) => format!("~/{}", rel.display()),
+        Ok(rel) => format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display()),
         Err(_) => path.display().to_string(),
     }
 }
@@ -640,11 +775,12 @@ mod tests {
 
     #[test]
     fn display_path_abbreviates_home() {
+        let sep = std::path::MAIN_SEPARATOR;
         let home = Path::new("/Users/someone");
         assert_eq!(display_path(home, home), "~");
         assert_eq!(
-            display_path(&home.join("Developer/x"), home),
-            "~/Developer/x"
+            display_path(&home.join("Developer").join("x"), home),
+            format!("~{sep}Developer{sep}x")
         );
         assert_eq!(
             display_path(Path::new("/opt/homebrew"), home),
@@ -707,13 +843,111 @@ mod tests {
     }
 
     #[test]
+    fn bin_and_obj_count_only_beside_a_project_file() {
+        let td = tempdir().unwrap();
+        let proj = td.path().join("App");
+        fs::create_dir_all(proj.join("bin")).unwrap();
+        fs::create_dir_all(proj.join("obj")).unwrap();
+        fs::write(proj.join("App.csproj"), "").unwrap();
+        assert_eq!(classify(td.path(), "bin"), Some(Category::DotNetBuild));
+        assert_eq!(classify(td.path(), "obj"), Some(Category::DotNetBuild));
+
+        // A stray bin/ is just a directory named bin.
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("tools/bin")).unwrap();
+        assert_eq!(classify(td2.path(), "bin"), None);
+    }
+
+    #[test]
+    fn gradle_build_counts_only_beside_a_gradle_script() {
+        let td = tempdir().unwrap();
+        let proj = td.path().join("app");
+        fs::create_dir_all(proj.join("build")).unwrap();
+        fs::write(proj.join("build.gradle.kts"), "").unwrap();
+        assert_eq!(classify(td.path(), "build"), Some(Category::GradleBuild));
+
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("cmake/build")).unwrap();
+        assert_eq!(classify(td2.path(), "build"), None);
+    }
+
+    #[test]
+    fn vs_cache_needs_no_marker_file() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(td.path().join("Sln/.vs")).unwrap();
+        assert_eq!(
+            classify(td.path(), ".vs"),
+            Some(Category::VisualStudioCache)
+        );
+    }
+
+    #[test]
     fn only_regenerable_categories_are_marked_safe() {
         assert!(Category::RustTarget.safe_to_delete());
         assert!(Category::NodeModules.safe_to_delete());
         assert!(Category::UvCache.safe_to_delete());
+        assert!(Category::WindowsTemp.safe_to_delete());
+        assert!(Category::RecycleBin.safe_to_delete());
         assert!(!Category::IphoneBackups.safe_to_delete());
         assert!(!Category::IosSimulators.safe_to_delete());
         assert!(!Category::PythonEnv.safe_to_delete());
+        // Deleting these breaks repair/uninstall or throws away real state.
+        assert!(!Category::WindowsOld.safe_to_delete());
+        assert!(!Category::InstallerCache.safe_to_delete());
+        assert!(!Category::DockerData.safe_to_delete());
+    }
+
+    #[test]
+    fn an_electron_apps_bundled_deps_are_not_reclaimable() {
+        let td = tempdir().unwrap();
+        // The layout that made diskscout try to gut Claude Desktop.
+        let packaged = td
+            .path()
+            .join("SomeApp/app-1.2.3/resources/app.asar.unpacked");
+        fs::create_dir_all(packaged.join("node_modules")).unwrap();
+        assert_eq!(classify(td.path(), "node_modules"), None);
+
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("OtherApp/resources/app/node_modules")).unwrap();
+        assert_eq!(classify(td2.path(), "node_modules"), None);
+
+        // A real project is still caught.
+        let td3 = tempdir().unwrap();
+        fs::create_dir_all(td3.path().join("myproject/node_modules")).unwrap();
+        assert_eq!(
+            classify(td3.path(), "node_modules"),
+            Some(Category::NodeModules)
+        );
+    }
+
+    #[test]
+    fn slugs_are_cli_safe_and_unique() {
+        assert_eq!(Category::BrowserCache.slug(), "browser-caches");
+        assert_eq!(Category::RustTarget.slug(), "rust-target");
+        assert_eq!(Category::DotNetBuild.slug(), "net-bin-obj");
+        assert_eq!(Category::YarnPnpmCache.slug(), "yarn-pnpm-store");
+
+        let all: Vec<String> = crate::report::all_categories().map(|c| c.slug()).collect();
+        let mut unique = all.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(all.len(), unique.len(), "two categories share a slug");
+        assert!(
+            all.iter().all(|s| !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')),
+            "a slug would need shell quoting"
+        );
+    }
+
+    #[test]
+    fn live_os_directories_are_emptied_not_removed() {
+        assert!(Category::WindowsTemp.delete_contents_only());
+        assert!(Category::RecycleBin.delete_contents_only());
+        assert!(Category::BrowserCache.delete_contents_only());
+        // Project-local artifacts go away wholesale.
+        assert!(!Category::RustTarget.delete_contents_only());
+        assert!(!Category::NodeModules.delete_contents_only());
     }
 
     #[test]

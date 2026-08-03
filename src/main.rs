@@ -4,6 +4,7 @@ use std::path::PathBuf;
 mod bootstrap;
 mod cleaner;
 mod dump;
+mod platform;
 mod report;
 mod scanner;
 
@@ -48,6 +49,18 @@ struct ScanArgs {
     #[arg(long)]
     delete_targets: bool,
 
+    /// Delete every category marked regenerable, skipping the rest
+    #[arg(long)]
+    delete_safe: bool,
+
+    /// Answer yes to the --delete-safe confirmation
+    #[arg(long, short = 'y')]
+    yes: bool,
+
+    /// Categories --delete-safe must leave alone, e.g. --except browser-caches
+    #[arg(long, value_delimiter = ',', value_name = "CAT")]
+    except: Vec<String>,
+
     /// Days since last modification before a file is flagged as old
     #[arg(long, default_value_t = 180)]
     old_after: u64,
@@ -56,7 +69,7 @@ struct ScanArgs {
     #[arg(long, default_value_t = 100)]
     large_over: u64,
 
-    /// Skip macOS system caches, Xcode, and iPhone backups
+    /// Skip OS caches, browser caches, and other system directories
     #[arg(long)]
     no_system: bool,
 }
@@ -74,9 +87,13 @@ fn main() {
 
     let cli = cli.scan;
 
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .expect("$HOME is not set");
+    let Some(home) = platform::home_dir() else {
+        eprintln!(
+            "diskscout: cannot locate your home directory ({} is not set)",
+            platform::HOME_VAR
+        );
+        std::process::exit(1);
+    };
 
     let root = cli.path.clone().unwrap_or_else(|| home.clone());
 
@@ -91,7 +108,7 @@ fn main() {
     let result = Scanner::new(config).scan();
     report::print_report(&result, &home);
 
-    let dump_path = PathBuf::from("/tmp/diskscout-report.txt");
+    let dump_path = platform::report_path();
     match dump::write_full_report(&result, &home, &dump_path) {
         Ok(()) => println!("  Full untruncated report: {}\n", dump_path.display()),
         Err(e) => eprintln!(
@@ -102,6 +119,11 @@ fn main() {
 
     if cli.delete_targets {
         cleaner::delete_category(&result, Category::RustTarget, &home);
+    } else if cli.delete_safe {
+        if let Err(e) = cleaner::delete_safe(&result, &home, cli.yes, &cli.except) {
+            eprintln!("diskscout: {e}");
+            std::process::exit(1);
+        }
     } else if cli.delete {
         cleaner::interactive_delete(&result, &home);
     }

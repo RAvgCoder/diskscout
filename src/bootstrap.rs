@@ -6,7 +6,7 @@
 //!
 //! Source resolution order:
 //!   1. `DISKSCOUT_SRC` if set and pointing at a diskscout checkout
-//!   2. auto-discovery scan under `~/Developer`
+//!   2. auto-discovery scan under the platform's usual checkout roots
 //!   3. the current working directory
 //!
 //! Once resolved, the path is written back as an `export DISKSCOUT_SRC=...`
@@ -44,7 +44,10 @@ pub fn run(args: &BootstrapArgs) -> Result<(), String> {
         persist_source_env(None);
         println!();
         println!("{}", "done".green().bold());
-        println!("  Run {} to load completions now.", "exec $SHELL".cyan());
+        println!(
+            "  Run {} to load completions now.",
+            Shell::detect().reload_hint().cyan()
+        );
         return Ok(());
     }
 
@@ -61,7 +64,10 @@ pub fn run(args: &BootstrapArgs) -> Result<(), String> {
 
     println!();
     println!("{}", "setup complete".green().bold());
-    println!("  Run {} to load completions now.", "exec $SHELL".cyan());
+    println!(
+        "  Run {} to load completions now.",
+        Shell::detect().reload_hint().cyan()
+    );
     Ok(())
 }
 
@@ -91,20 +97,25 @@ fn resolve_source() -> Result<PathBuf, String> {
         return Ok(cwd);
     }
 
+    let example = match Shell::detect() {
+        Shell::Pwsh => format!("$env:{SRC_ENV} = \"$HOME\\Developer\\diskscout\""),
+        _ => format!("export {SRC_ENV}=~/Developer/diskscout"),
+    };
     Err(format!(
-        "no diskscout checkout found.\n  Set {SRC_ENV} to the repo path, e.g.\n    export {SRC_ENV}=~/Developer/diskscout"
+        "no diskscout checkout found.\n  Set {SRC_ENV} to the repo path, e.g.\n    {example}"
     ))
 }
 
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "build", "dist", ".git"];
 
 fn discover_workspace() -> Option<PathBuf> {
-    let dev = PathBuf::from(std::env::var_os("HOME")?).join("Developer");
-    if !dev.is_dir() {
-        return None;
-    }
+    let home = crate::platform::home_dir()?;
     let mut hits = Vec::new();
-    scan(&dev, 0, 4, &mut hits);
+    for root in crate::platform::workspace_roots(&home) {
+        if root.is_dir() {
+            scan(&root, 0, 4, &mut hits);
+        }
+    }
     hits.sort();
     hits.into_iter().next()
 }
@@ -188,10 +199,16 @@ enum Shell {
     Zsh,
     Bash,
     Fish,
+    Pwsh,
 }
 
 impl Shell {
     fn detect() -> Self {
+        // Windows has no $SHELL; PowerShell is the shell that has completions
+        // worth generating, and cmd.exe has none at all.
+        if cfg!(windows) {
+            return Shell::Pwsh;
+        }
         let shell = std::env::var("SHELL").unwrap_or_default();
         if shell.contains("zsh") {
             Shell::Zsh
@@ -199,6 +216,14 @@ impl Shell {
             Shell::Fish
         } else {
             Shell::Bash
+        }
+    }
+
+    /// What to tell the user to run so the new completions load now.
+    fn reload_hint(&self) -> &'static str {
+        match self {
+            Shell::Pwsh => ". $PROFILE",
+            _ => "exec $SHELL",
         }
     }
 }
@@ -236,8 +261,54 @@ fn write_completions() -> Result<(), String> {
             write_completion_file(&dir, "diskscout.fish", CompShell::Fish, &mut cmd)?;
             // fish auto-loads this directory; no rc edit needed.
         }
+        Shell::Pwsh => {
+            let profile = powershell_profile(&home);
+            let dir = profile
+                .parent()
+                .map_or_else(|| home.clone(), Path::to_path_buf)
+                .join("Completions");
+            write_completion_file(&dir, "diskscout.ps1", CompShell::PowerShell, &mut cmd)?;
+            patch_rc(
+                &profile,
+                "# diskscout completions",
+                &format!(
+                    "# diskscout completions\n. \"{}\"\n",
+                    dir.join("diskscout.ps1").display()
+                ),
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Asks PowerShell where `$PROFILE` is, because OneDrive folder redirection
+/// moves Documents and the path cannot be assumed. Falls back to the default
+/// location for whichever edition answered.
+#[cfg(windows)]
+fn powershell_profile(home: &Path) -> PathBuf {
+    for exe in ["pwsh", "powershell"] {
+        let out = Command::new(exe)
+            .args(["-NoProfile", "-NonInteractive", "-Command", "$PROFILE"])
+            .output();
+        if let Ok(out) = out
+            && out.status.success()
+        {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    home.join("Documents")
+        .join("WindowsPowerShell")
+        .join("Microsoft.PowerShell_profile.ps1")
+}
+
+#[cfg(not(windows))]
+fn powershell_profile(home: &Path) -> PathBuf {
+    home.join(".config")
+        .join("powershell")
+        .join("Microsoft.PowerShell_profile.ps1")
 }
 
 fn write_completion_file(
@@ -289,22 +360,26 @@ fn persist_source_env(source: Option<&Path>) {
     let Ok(home) = home_dir() else {
         return;
     };
-    let rc = if matches!(Shell::detect(), Shell::Fish) {
-        home.join(".config/fish/config.fish")
-    } else if home.join(".zshrc").exists() {
-        home.join(".zshrc")
-    } else {
-        home.join(".bashrc")
+    let shell = Shell::detect();
+    let rc = match shell {
+        Shell::Pwsh => powershell_profile(&home),
+        Shell::Fish => home.join(".config/fish/config.fish"),
+        _ if home.join(".zshrc").exists() => home.join(".zshrc"),
+        _ => home.join(".bashrc"),
     };
 
+    let marker = match shell {
+        Shell::Pwsh => format!("$env:{SRC_ENV} ="),
+        _ => format!("export {SRC_ENV}="),
+    };
     let existing = std::fs::read_to_string(&rc).unwrap_or_default();
-    if existing.contains(&format!("export {SRC_ENV}=")) {
+    if existing.contains(&marker) {
         return;
     }
-    let line = if matches!(Shell::detect(), Shell::Fish) {
-        format!("\nset -gx {SRC_ENV} \"{}\"\n", source.display())
-    } else {
-        format!("\nexport {SRC_ENV}=\"{}\"\n", source.display())
+    let line = match shell {
+        Shell::Pwsh => format!("\n$env:{SRC_ENV} = \"{}\"\n", source.display()),
+        Shell::Fish => format!("\nset -gx {SRC_ENV} \"{}\"\n", source.display()),
+        _ => format!("\nexport {SRC_ENV}=\"{}\"\n", source.display()),
     };
     if append_line(&rc, &line).is_ok() {
         println!(
@@ -321,6 +396,10 @@ fn persist_source_env(source: Option<&Path>) {
 // ---------------------------------------------------------------------------
 
 fn append_line(path: &Path, text: &str) -> Result<(), String> {
+    // A PowerShell profile often has no directory yet on a fresh install.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -331,15 +410,14 @@ fn append_line(path: &Path, text: &str) -> Result<(), String> {
 }
 
 fn home_dir() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "$HOME is not set".to_owned())
+    crate::platform::home_dir().ok_or_else(|| format!("{} is not set", crate::platform::HOME_VAR))
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
-    match s.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from(s), |h| PathBuf::from(h).join(rest)),
+    match s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        Some(rest) => {
+            crate::platform::home_dir().map_or_else(|| PathBuf::from(s), |h| h.join(rest))
+        }
         None => PathBuf::from(s),
     }
 }

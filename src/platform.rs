@@ -127,9 +127,16 @@ pub fn size_on_disk(path: &Path, meta: &std::fs::Metadata) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
+/// Bytes a file actually occupies. A sparse VM disk or simulator image
+/// advertises the size it could grow to, so the logical length invents
+/// reclaimable space that deleting cannot return; `st_blocks` counts the
+/// 512-byte units really allocated. Capped at the length so block slack cannot
+/// push an ordinary file above the figure Windows reports for it.
 #[cfg(not(windows))]
 pub fn size_on_disk(_path: &Path, meta: &std::fs::Metadata) -> u64 {
-    meta.len()
+    use std::os::unix::fs::MetadataExt;
+
+    meta.blocks().saturating_mul(512).min(meta.len())
 }
 
 /// Extensions worth flagging as forgotten installers or VM images.
@@ -601,6 +608,28 @@ mod size_tests {
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
+            .unwrap()
+            .set_len(LOGICAL)
+            .unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), LOGICAL, "the logical length is the whole 64 MB");
+        assert!(
+            size_on_disk(&path, &meta) < LOGICAL / 2,
+            "the hole must not be counted"
+        );
+    }
+
+    // APFS makes a truncate-extended file sparse, the shape Docker.raw and the
+    // simulator device images have.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_sparse_file_counts_its_allocation_not_its_hole() {
+        const LOGICAL: u64 = 64 * 1_048_576;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.img");
+        std::fs::File::create(&path)
             .unwrap()
             .set_len(LOGICAL)
             .unwrap();

@@ -55,10 +55,12 @@ pub fn delete_safe(
         .filter(|c| c.safe_to_delete() && !result.dirs_by_category(*c).is_empty())
         .collect();
 
-    // An unrecognised name means the caller believed something was excluded
-    // that is not, so refuse rather than delete it.
+    // A name matching no category at all is a typo, and the caller believes it
+    // held something back, so refuse rather than delete it. Naming a real
+    // category this scan did not turn up already excludes nothing, which is
+    // what a fixed --except set on a machine without that cache means.
     for name in except {
-        if !candidates.iter().any(|c| &c.slug() == name) {
+        if !all_categories().any(|c| &c.slug() == name) {
             let valid: Vec<String> = candidates.iter().map(|c| c.slug()).collect();
             return Err(format!(
                 "unknown category '{name}'.\n  Deletable categories in this scan: {}",
@@ -278,4 +280,33 @@ fn confirm(prompt: &str) -> bool {
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     input.trim().eq_ignore_ascii_case("y")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An empty scan deletes nothing, so these reach the validation and stop.
+    fn check(except: &str) -> Result<(), String> {
+        delete_safe(
+            &ScanResult::default(),
+            Path::new("/"),
+            true,
+            &[except.to_owned()],
+        )
+    }
+
+    #[test]
+    fn except_accepts_a_category_this_scan_did_not_find() {
+        assert!(check("browser-caches").is_ok());
+        assert!(check("recycle-bin").is_ok());
+        // Naming one that is never auto-deleted is redundant, not wrong.
+        assert!(check("iphone-backups").is_ok());
+    }
+
+    #[test]
+    fn except_rejects_a_name_that_is_no_category_at_all() {
+        assert!(check("brwoser-caches").is_err());
+        assert!(check("").is_err());
+    }
 }

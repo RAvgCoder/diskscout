@@ -43,6 +43,7 @@ pub enum Category {
     // Per-application state outside the walk.
     AppWebCache,
     ContainerCaches,
+    ExpensiveCache,
     CloudMirror,
     // Windows system directories.
     WindowsTemp,
@@ -98,6 +99,7 @@ impl Category {
             Category::IphoneBackups => "iPhone Backups",
             Category::AppWebCache => "App web caches",
             Category::ContainerCaches => "App container caches",
+            Category::ExpensiveCache => "Expensive caches",
             Category::CloudMirror => "Cloud storage mirror",
             Category::WindowsTemp => "Temp files",
             Category::WindowsUpdate => "Windows Update cache",
@@ -193,6 +195,7 @@ impl Category {
                 | Category::BrowserCache
                 | Category::AppWebCache
                 | Category::ContainerCaches
+                | Category::ExpensiveCache
         )
     }
 }

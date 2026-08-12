@@ -43,6 +43,7 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
         &[
             Category::AppWebCache,
             Category::ContainerCaches,
+            Category::ExpensiveCache,
             Category::CloudMirror,
         ],
     ),

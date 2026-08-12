@@ -232,6 +232,7 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     let mut out = Vec::new();
 
     let support = home.join("Library/Application Support");
+    let containers = home.join("Library/Containers");
 
     let candidates = [
         // Resolve symlink so ~/.build_caches/xcode and the DerivedData symlink
@@ -282,6 +283,24 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         (support.join("MobileSync/Backup"), Category::IphoneBackups),
         (support.join("FileProvider"), Category::CloudMirror),
         (support.join("Google/DriveFS"), Category::CloudMirror),
+        // Claimed ahead of the generic container sweep below so they keep this
+        // category rather than the deletable one.
+        (
+            containers.join("com.apple.photoanalysisd/Data/Library/Caches"),
+            Category::ExpensiveCache,
+        ),
+        (
+            containers.join("com.apple.mediaanalysisd/Data/Library/Caches"),
+            Category::ExpensiveCache,
+        ),
+        (
+            containers.join("com.apple.texttospeech.SiriAUSP/Data/Library/Caches"),
+            Category::ExpensiveCache,
+        ),
+        (
+            home.join("Library/Caches/GeoServices"),
+            Category::ExpensiveCache,
+        ),
         (
             home.join("Library/Containers/com.docker.docker/Data"),
             Category::DockerData,
@@ -314,9 +333,9 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         }
     }
 
-    out.extend(instruments_traces());
-    out.extend(app_web_caches(&support));
-    out.extend(container_caches(home));
+    push_unclaimed(&mut out, instruments_traces());
+    push_unclaimed(&mut out, app_web_caches(&support));
+    push_unclaimed(&mut out, container_caches(home));
 
     if let Ok(out_bytes) = std::process::Command::new("brew").arg("--cache").output()
         && out_bytes.status.success()
@@ -332,19 +351,29 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     }
 
     // One entry per app rather than the whole directory, so the report names
-    // what is actually large instead of reporting one opaque total. Runs last
-    // so a path a more specific category already claimed keeps that category:
-    // Homebrew's cache and uv's both live in here.
+    // what is actually large instead of reporting one opaque total.
     if let Ok(entries) = std::fs::read_dir(home.join("Library/Caches")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && !out.iter().any(|(claimed, _)| claimed == &path) {
-                out.push((path, Category::MacOsCaches));
-            }
-        }
+        let per_app = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .map(|path| (path, Category::MacOsCaches))
+            .collect();
+        push_unclaimed(&mut out, per_app);
     }
 
     out
+}
+
+/// A broad sweep must not overwrite a category a specific rule already assigned,
+/// or a path deliberately held back would come back as deletable.
+#[cfg(not(windows))]
+fn push_unclaimed(out: &mut Vec<(PathBuf, Category)>, found: Vec<(PathBuf, Category)>) {
+    for (path, category) in found {
+        if !out.iter().any(|(claimed, _)| claimed == &path) {
+            out.push((path, category));
+        }
+    }
 }
 
 /// Identifies the allocation behind a file when more than one path shares it.
@@ -912,5 +941,36 @@ mod target_tests {
         let found: Vec<PathBuf> = container_caches(home).into_iter().map(|(p, _)| p).collect();
 
         assert_eq!(found, vec![real]);
+    }
+
+    #[test]
+    fn a_held_back_path_survives_the_sweep_that_would_reclassify_it() {
+        let held = PathBuf::from(
+            "/Users/x/Library/Containers/com.apple.photoanalysisd/Data/Library/Caches",
+        );
+        let ordinary = PathBuf::from("/Users/x/Library/Containers/com.other/Data/Library/Caches");
+
+        let mut out = vec![(held.clone(), Category::ExpensiveCache)];
+        push_unclaimed(
+            &mut out,
+            vec![
+                (held.clone(), Category::ContainerCaches),
+                (ordinary.clone(), Category::ContainerCaches),
+            ],
+        );
+
+        assert_eq!(
+            out,
+            vec![
+                (held, Category::ExpensiveCache),
+                (ordinary, Category::ContainerCaches),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_protected_caches_are_never_auto_deleted() {
+        assert!(!Category::ExpensiveCache.safe_to_delete());
+        assert!(Category::ExpensiveCache.delete_contents_only());
     }
 }

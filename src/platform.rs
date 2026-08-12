@@ -228,6 +228,8 @@ pub fn skip_paths(home: &Path) -> Vec<PathBuf> {
 pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     let mut out = Vec::new();
 
+    let support = home.join("Library/Application Support");
+
     let candidates = [
         // Resolve symlink so ~/.build_caches/xcode and the DerivedData symlink
         // don't both end up in the list and get double-counted.
@@ -237,14 +239,52 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
             Category::XcodeDerivedData,
         ),
         (
+            home.join("Library/Developer/XCTestDevices"),
+            Category::XcTestDevices,
+        ),
+        (
             home.join("Library/Developer/CoreSimulator/Devices"),
             Category::IosSimulators,
         ),
-        (home.join("Library/Caches"), Category::MacOsCaches),
+        // Root-owned, so a delete needs sudo; it is reported either way because
+        // a stale runtime is the largest thing Xcode leaves outside $HOME.
         (
-            home.join("Library/Application Support/MobileSync/Backup"),
-            Category::IphoneBackups,
+            PathBuf::from("/Library/Developer/CoreSimulator/Caches"),
+            Category::SimulatorRuntimes,
         ),
+        (
+            PathBuf::from("/Library/Developer/CoreSimulator/Images"),
+            Category::SimulatorRuntimes,
+        ),
+        (
+            home.join("Library/Developer/Xcode/iOS DeviceSupport"),
+            Category::XcodeDeviceSupport,
+        ),
+        (
+            home.join("Library/Developer/Xcode/watchOS DeviceSupport"),
+            Category::XcodeDeviceSupport,
+        ),
+        (
+            home.join("Library/Developer/Xcode/tvOS DeviceSupport"),
+            Category::XcodeDeviceSupport,
+        ),
+        (
+            home.join("Library/Developer/Xcode/DocumentationCache"),
+            Category::XcodeCaches,
+        ),
+        (
+            home.join("Library/Developer/XcodeBuildMCP/workspaces"),
+            Category::XcodeCaches,
+        ),
+        (support.join("MobileSync/Backup"), Category::IphoneBackups),
+        (support.join("FileProvider"), Category::CloudMirror),
+        (support.join("Google/DriveFS"), Category::CloudMirror),
+        (
+            home.join("Library/Containers/com.docker.docker/Data"),
+            Category::DockerData,
+        ),
+        (home.join("Library/Android/sdk"), Category::AndroidSdk),
+        (home.join(".android/avd"), Category::AndroidEmulator),
         (home.join(".npm/_cacache"), Category::NpmCache),
         (home.join(".cache/uv"), Category::UvCache),
         (home.join("Library/Caches/uv"), Category::UvCache),
@@ -256,6 +296,10 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
             out.push((path, cat));
         }
     }
+
+    out.extend(instruments_traces());
+    out.extend(app_web_caches(&support));
+    out.extend(container_caches(home));
 
     if let Ok(out_bytes) = std::process::Command::new("brew").arg("--cache").output()
         && out_bytes.status.success()
@@ -270,7 +314,151 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         }
     }
 
+    // One entry per app rather than the whole directory, so the report names
+    // what is actually large instead of reporting one opaque total. Runs last
+    // so a path a more specific category already claimed keeps that category:
+    // Homebrew's cache and uv's both live in here.
+    if let Ok(entries) = std::fs::read_dir(home.join("Library/Caches")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && !out.iter().any(|(claimed, _)| claimed == &path) {
+                out.push((path, Category::MacOsCaches));
+            }
+        }
+    }
+
     out
+}
+
+/// Identifies the allocation behind a file when more than one path shares it.
+/// Cargo and pnpm hard-link aggressively, and counting one blob once per link
+/// invents space that deleting the tree cannot return.
+#[cfg(not(windows))]
+pub fn hard_link_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    (meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
+}
+
+/// std exposes no stable file index on Windows, and reading one costs a handle
+/// open per file, so links there are counted separately.
+#[cfg(windows)]
+pub fn hard_link_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// The per-user `C` and `T` roots under /var/folders. launchd exports the temp
+/// one as TMPDIR; getconf is the documented way to find them when it is not.
+#[cfg(not(windows))]
+fn darwin_user_dirs() -> Option<(PathBuf, PathBuf)> {
+    let anchor = if let Some(tmp) = std::env::var_os("TMPDIR") {
+        PathBuf::from(tmp)
+    } else {
+        let out = std::process::Command::new("getconf")
+            .arg("DARWIN_USER_CACHE_DIR")
+            .output()
+            .ok()?;
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    };
+
+    if !anchor.is_absolute() {
+        return None;
+    }
+    let base = anchor.parent()?;
+    Some((base.join("C"), base.join("T")))
+}
+
+/// Instruments keeps every recording it has ever taken, and a run that is
+/// killed leaves its trace in the temp dir where nothing collects it. Both sit
+/// under /var/folders, which the walker never descends into.
+#[cfg(not(windows))]
+fn instruments_traces() -> Vec<(PathBuf, Category)> {
+    let Some((cache, temp)) = darwin_user_dirs() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+
+    let recordings = cache.join("com.apple.dt.Instruments");
+    if recordings.is_dir() {
+        out.push((recordings, Category::InstrumentsTraces));
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&temp) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "ktrace") {
+                out.push((path, Category::InstrumentsTraces));
+            }
+        }
+    }
+
+    out
+}
+
+/// The directory names Chromium uses for its caches, identical under every
+/// Electron app, browser profile and session partition.
+#[cfg(not(windows))]
+const WEB_CACHE_DIRS: &[&str] = &[
+    "Cache",
+    "CachedData",
+    "Code Cache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GPUCache",
+    "GrShaderCache",
+    "ShaderCache",
+    "Service Worker",
+    "component_crx_cache",
+];
+
+#[cfg(not(windows))]
+fn app_web_caches(support: &Path) -> Vec<(PathBuf, Category)> {
+    let mut out = Vec::new();
+    // Deep enough for <app>/Partitions/<session>/Cache and <browser>/<profile>/Cache.
+    collect_web_caches(support, 3, &mut out);
+    out
+}
+
+/// Matching on the name finds every Electron app's cache without naming one.
+/// A matched directory is never descended into, so nothing is counted twice.
+#[cfg(not(windows))]
+fn collect_web_caches(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, Category)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        // read_dir reports a symlink as a symlink, so this cannot follow one
+        // out of Application Support or into a cycle.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if WEB_CACHE_DIRS
+            .iter()
+            .any(|name| entry.file_name() == **name)
+        {
+            out.push((entry.path(), Category::AppWebCache));
+        } else if depth > 0 {
+            collect_web_caches(&entry.path(), depth - 1, out);
+        }
+    }
+}
+
+/// A sandboxed app caches inside its container rather than in ~/Library/Caches,
+/// so scanning that one directory never sees any of it.
+#[cfg(not(windows))]
+fn container_caches(home: &Path) -> Vec<(PathBuf, Category)> {
+    let Ok(entries) = std::fs::read_dir(home.join("Library/Containers")) else {
+        return Vec::new();
+    };
+
+    entries
+        .flatten()
+        .map(|entry| entry.path().join("Data/Library/Caches"))
+        .filter(|path| path.is_dir())
+        .map(|path| (path, Category::ContainerCaches))
+        .collect()
 }
 
 /// Build caches that live outside any project directory.
@@ -640,5 +828,72 @@ mod size_tests {
             size_on_disk(&path, &meta) < LOGICAL / 2,
             "the hole must not be counted"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn only_a_file_with_more_than_one_link_has_an_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let alone = dir.path().join("alone");
+        let shared = dir.path().join("shared");
+        std::fs::write(&alone, b"a").unwrap();
+        std::fs::write(&shared, b"b").unwrap();
+        std::fs::hard_link(&shared, dir.path().join("other-name")).unwrap();
+
+        assert!(hard_link_id(&std::fs::metadata(&alone).unwrap()).is_none());
+        assert_eq!(
+            hard_link_id(&std::fs::metadata(&shared).unwrap()),
+            hard_link_id(&std::fs::metadata(dir.path().join("other-name")).unwrap()),
+            "both names must resolve to the same allocation"
+        );
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn a_web_cache_is_found_at_every_depth_and_never_descended_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let support = dir.path();
+        // The three shapes seen in the wild: an app, a session partition, and
+        // a browser profile.
+        let plain = support.join("Discord/Cache");
+        let partition = support.join("Notion/Partitions/notion/Service Worker");
+        let profile = support.join("Google/Chrome/Default/Code Cache");
+        for path in [&plain, &partition, &profile] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        // Chromium nests a directory of the same name inside the cache itself.
+        std::fs::create_dir_all(plain.join("Cache")).unwrap();
+
+        let found: Vec<PathBuf> = app_web_caches(support)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+
+        assert!(found.contains(&plain), "{found:?}");
+        assert!(found.contains(&partition), "{found:?}");
+        assert!(found.contains(&profile), "{found:?}");
+        assert!(
+            !found.contains(&plain.join("Cache")),
+            "a nested match would be counted twice: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_containers_cache_is_found_only_at_the_sandbox_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let containers = home.join("Library/Containers");
+        let real = containers.join("com.apple.Safari/Data/Library/Caches");
+        std::fs::create_dir_all(&real).unwrap();
+        // A container that keeps no cache contributes nothing.
+        std::fs::create_dir_all(containers.join("com.empty.app/Data")).unwrap();
+
+        let found: Vec<PathBuf> = container_caches(home).into_iter().map(|(p, _)| p).collect();
+
+        assert_eq!(found, vec![real]);
     }
 }

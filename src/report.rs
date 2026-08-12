@@ -18,6 +18,7 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
             Category::Nuxt,
             Category::SvelteKit,
             Category::CocoaPods,
+            Category::SwiftPmBuild,
             Category::DotNetBuild,
             Category::VisualStudioCache,
             Category::GradleBuild,
@@ -27,9 +28,22 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
         "MACOS & XCODE",
         &[
             Category::XcodeDerivedData,
+            Category::XcTestDevices,
             Category::IosSimulators,
+            Category::SimulatorRuntimes,
+            Category::XcodeDeviceSupport,
+            Category::XcodeCaches,
+            Category::InstrumentsTraces,
             Category::MacOsCaches,
             Category::IphoneBackups,
+        ],
+    ),
+    (
+        "APP DATA & CACHES",
+        &[
+            Category::AppWebCache,
+            Category::ContainerCaches,
+            Category::CloudMirror,
         ],
     ),
     (
@@ -64,7 +78,11 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
     ),
     (
         "VMS, SDKS & CONTAINERS",
-        &[Category::DockerData, Category::AndroidSdk],
+        &[
+            Category::DockerData,
+            Category::AndroidSdk,
+            Category::AndroidEmulator,
+        ],
     ),
 ];
 

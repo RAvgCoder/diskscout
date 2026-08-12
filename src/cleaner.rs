@@ -190,7 +190,9 @@ fn remove_reporting(dir: &FoundDir, home: &Path, indent: &str) -> u64 {
 /// on Windows: measure what is actually left rather than trusting the size the
 /// scan recorded.
 fn remove(dir: &FoundDir) -> (u64, Option<String>) {
-    let outcome = if dir.category.delete_contents_only() {
+    let outcome = if dir.path.is_file() {
+        fs::remove_file(&dir.path).map_err(|e| e.to_string())
+    } else if dir.category.delete_contents_only() {
         clear_contents(&dir.path)
     } else {
         force_remove_dir_all(&dir.path)
@@ -308,5 +310,45 @@ mod tests {
     fn except_rejects_a_name_that_is_no_category_at_all() {
         assert!(check("brwoser-caches").is_err());
         assert!(check("").is_err());
+    }
+
+    // An abandoned Instruments recording is a loose file, not a directory.
+    #[test]
+    fn a_file_target_is_removed_rather_than_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = dir.path().join("instrumentsAbc.ktrace");
+        fs::write(&trace, vec![0u8; 4_096]).unwrap();
+
+        let (freed, error) = remove(&FoundDir {
+            path: trace.clone(),
+            category: Category::InstrumentsTraces,
+            size: 4_096,
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+        });
+
+        assert_eq!(error, None);
+        assert_eq!(freed, 4_096);
+        assert!(!trace.exists());
+    }
+
+    // A contents-only category keeps the directory the OS expects to exist.
+    #[test]
+    fn clearing_a_live_cache_leaves_the_directory_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("Cache");
+        fs::create_dir_all(cache.join("nested")).unwrap();
+        fs::write(cache.join("nested").join("blob"), vec![0u8; 2_048]).unwrap();
+
+        let (freed, error) = remove(&FoundDir {
+            path: cache.clone(),
+            category: Category::AppWebCache,
+            size: 2_048,
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+        });
+
+        assert_eq!(error, None);
+        assert_eq!(freed, 2_048);
+        assert!(cache.is_dir(), "the cache root must survive");
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
     }
 }

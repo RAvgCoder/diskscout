@@ -1,6 +1,7 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
@@ -25,14 +26,24 @@ pub enum Category {
     Nuxt,
     SvelteKit,
     CocoaPods,
+    SwiftPmBuild,
     DotNetBuild,
     VisualStudioCache,
     GradleBuild,
     // macOS system directories.
     XcodeDerivedData,
+    XcTestDevices,
     IosSimulators,
+    SimulatorRuntimes,
+    XcodeDeviceSupport,
+    XcodeCaches,
+    InstrumentsTraces,
     MacOsCaches,
     IphoneBackups,
+    // Per-application state outside the walk.
+    AppWebCache,
+    ContainerCaches,
+    CloudMirror,
     // Windows system directories.
     WindowsTemp,
     WindowsUpdate,
@@ -58,6 +69,7 @@ pub enum Category {
     // Large payloads that hold real state.
     DockerData,
     AndroidSdk,
+    AndroidEmulator,
 }
 
 impl Category {
@@ -71,13 +83,22 @@ impl Category {
             Category::Nuxt => "Nuxt .nuxt/",
             Category::SvelteKit => "SvelteKit .svelte-kit/",
             Category::CocoaPods => "CocoaPods Pods/",
+            Category::SwiftPmBuild => "SwiftPM .build/",
             Category::DotNetBuild => ".NET bin/ + obj/",
             Category::VisualStudioCache => "Visual Studio .vs/",
             Category::GradleBuild => "Gradle build/",
             Category::XcodeDerivedData => "Xcode DerivedData",
+            Category::XcTestDevices => "XCTest simulator clones",
             Category::IosSimulators => "iOS Simulators",
+            Category::SimulatorRuntimes => "Simulator runtimes",
+            Category::XcodeDeviceSupport => "Xcode device support",
+            Category::XcodeCaches => "Xcode caches",
+            Category::InstrumentsTraces => "Instruments traces",
             Category::MacOsCaches => "macOS Caches",
             Category::IphoneBackups => "iPhone Backups",
+            Category::AppWebCache => "App web caches",
+            Category::ContainerCaches => "App container caches",
+            Category::CloudMirror => "Cloud storage mirror",
             Category::WindowsTemp => "Temp files",
             Category::WindowsUpdate => "Windows Update cache",
             Category::WindowsOld => "Previous Windows install",
@@ -99,7 +120,8 @@ impl Category {
             Category::GoModCache => "Go module cache",
             Category::IdeCache => "IDE caches",
             Category::DockerData => "Docker / WSL data",
-            Category::AndroidSdk => "Android SDK & emulators",
+            Category::AndroidSdk => "Android SDK",
+            Category::AndroidEmulator => "Android emulator images",
         }
     }
 
@@ -111,9 +133,17 @@ impl Category {
             Category::RustTarget
                 | Category::NodeModules
                 | Category::PythonBytecode
+                | Category::SwiftPmBuild
                 | Category::DotNetBuild
                 | Category::VisualStudioCache
                 | Category::GradleBuild
+                | Category::XcTestDevices
+                | Category::MacOsCaches
+                | Category::XcodeDeviceSupport
+                | Category::XcodeCaches
+                | Category::InstrumentsTraces
+                | Category::AppWebCache
+                | Category::ContainerCaches
                 | Category::WindowsTemp
                 | Category::WindowsUpdate
                 | Category::RecycleBin
@@ -161,6 +191,8 @@ impl Category {
                 | Category::WindowsCaches
                 | Category::ThumbnailCache
                 | Category::BrowserCache
+                | Category::AppWebCache
+                | Category::ContainerCaches
         )
     }
 }
@@ -343,10 +375,7 @@ impl Scanner {
         }
         pending.extend(platform::build_cache_targets(&self.config.home));
 
-        // Two targets can resolve to the same directory (%TEMP% under a
-        // relocated profile, say); sizing it twice would inflate the total.
-        pending.sort_by(|a, b| a.0.cmp(&b.0));
-        pending.dedup_by(|a, b| a.0 == b.0);
+        let pending = keep_outermost(pending);
 
         eprintln!("Found {} directories -- computing sizes...", pending.len());
 
@@ -623,13 +652,29 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
             }
         }
         ".vs" => Some(Category::VisualStudioCache),
-        "build" => {
-            if parent.join("build.gradle").exists() || parent.join("build.gradle.kts").exists() {
+        // Gradle writes all three next to the build script: the output tree, a
+        // project-local daemon cache, and the NDK's native build.
+        "build" | ".gradle" | ".cxx" => {
+            if parent.join("build.gradle").exists()
+                || parent.join("build.gradle.kts").exists()
+                || parent.join("settings.gradle").exists()
+                || parent.join("settings.gradle.kts").exists()
+            {
                 Some(Category::GradleBuild)
             } else {
                 None
             }
         }
+        ".build" => {
+            if parent.join("Package.swift").exists() {
+                Some(Category::SwiftPmBuild)
+            } else {
+                None
+            }
+        }
+        // Xcode's default is the shared one under ~/Library, but a project can
+        // redirect it next to the sources.
+        "DerivedData" => Some(Category::XcodeDerivedData),
         "packages" => {
             if has_sibling_ext(parent, &["sln"]) {
                 Some(Category::NugetCache)
@@ -669,10 +714,29 @@ fn has_sibling_ext(dir: &Path, exts: &[&str]) -> bool {
     })
 }
 
+/// Two targets can name the same directory (%TEMP% under a relocated profile),
+/// and one can sit inside another (a sandboxed app's cache inside its own
+/// container). Sizing either twice inflates the total, so only the outermost of
+/// an overlap survives. Path order puts an ancestor ahead of everything under it.
+fn keep_outermost(mut targets: Vec<(PathBuf, Category)>) -> Vec<(PathBuf, Category)> {
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut kept: Vec<(PathBuf, Category)> = Vec::with_capacity(targets.len());
+    for (path, category) in targets {
+        if !kept.iter().any(|(outer, _)| path.starts_with(outer)) {
+            kept.push((path, category));
+        }
+    }
+    kept
+}
+
 // Computes total size and most-recent modification time in a single walk.
+// Hard links are counted once per walk, so a blob linked from two targets is
+// still counted twice; nothing observed links across targets.
 pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
     let mut size = 0u64;
     let mut newest = SystemTime::UNIX_EPOCH;
+    let mut linked = HashSet::new();
     for entry in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
@@ -682,6 +746,9 @@ pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
             && let Ok(meta) = entry.metadata()
             && !platform::occupies_no_local_space(&meta)
         {
+            if platform::hard_link_id(&meta).is_some_and(|id| !linked.insert(id)) {
+                continue;
+            }
             size += platform::size_on_disk(entry.path(), &meta);
             if let Ok(modified) = meta.modified()
                 && modified > newest
@@ -872,6 +939,89 @@ mod tests {
     }
 
     #[test]
+    fn gradle_daemon_and_ndk_dirs_count_beside_a_settings_script() {
+        let td = tempdir().unwrap();
+        let proj = td.path().join("app");
+        fs::create_dir_all(proj.join(".gradle")).unwrap();
+        fs::create_dir_all(proj.join(".cxx")).unwrap();
+        fs::write(proj.join("settings.gradle"), "").unwrap();
+
+        assert_eq!(classify(td.path(), ".gradle"), Some(Category::GradleBuild));
+        assert_eq!(classify(td.path(), ".cxx"), Some(Category::GradleBuild));
+
+        // ~/.gradle is the user-wide cache, a different category entirely.
+        let bare = tempdir().unwrap();
+        fs::create_dir_all(bare.path().join("home/.gradle")).unwrap();
+        assert_eq!(classify(bare.path(), ".gradle"), None);
+    }
+
+    #[test]
+    fn swiftpm_build_counts_only_beside_a_package_manifest() {
+        let td = tempdir().unwrap();
+        let proj = td.path().join("Lib");
+        fs::create_dir_all(proj.join(".build")).unwrap();
+        fs::write(proj.join("Package.swift"), "").unwrap();
+        assert_eq!(classify(td.path(), ".build"), Some(Category::SwiftPmBuild));
+
+        let td2 = tempdir().unwrap();
+        fs::create_dir_all(td2.path().join("other/.build")).unwrap();
+        assert_eq!(classify(td2.path(), ".build"), None);
+    }
+
+    #[test]
+    fn a_project_local_derived_data_is_found_by_the_walk() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(td.path().join("App/DerivedData")).unwrap();
+        assert_eq!(
+            classify(td.path(), "DerivedData"),
+            Some(Category::XcodeDerivedData)
+        );
+    }
+
+    #[test]
+    fn a_target_inside_another_target_is_dropped() {
+        let container = PathBuf::from("/Users/x/Library/Containers/com.docker.docker/Data");
+        let inner = container.join("Library/Caches");
+        let sibling = PathBuf::from("/Users/x/Library/Containers/com.other.app/Data");
+
+        let kept = keep_outermost(vec![
+            (inner.clone(), Category::ContainerCaches),
+            (container.clone(), Category::DockerData),
+            (sibling.clone(), Category::ContainerCaches),
+            (container.clone(), Category::DockerData),
+        ]);
+
+        let paths: Vec<&PathBuf> = kept.iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec![&container, &sibling], "{kept:?}");
+    }
+
+    // A name that merely starts with another's text is not inside it.
+    #[test]
+    fn keep_outermost_compares_whole_path_components() {
+        let dir = PathBuf::from("/a/b");
+        let lookalike = PathBuf::from("/a/b-backup");
+
+        let kept = keep_outermost(vec![
+            (lookalike.clone(), Category::MacOsCaches),
+            (dir.clone(), Category::MacOsCaches),
+        ]);
+
+        assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_hard_linked_file_is_counted_once() {
+        let td = tempdir().unwrap();
+        let original = td.path().join("blob");
+        fs::write(&original, vec![0u8; 8_192]).unwrap();
+        fs::hard_link(&original, td.path().join("linked")).unwrap();
+
+        let (size, _) = dir_stats(td.path());
+        assert_eq!(size, 8_192, "the second link is the same allocation");
+    }
+
+    #[test]
     fn vs_cache_needs_no_marker_file() {
         let td = tempdir().unwrap();
         fs::create_dir_all(td.path().join("Sln/.vs")).unwrap();
@@ -895,6 +1045,11 @@ mod tests {
         assert!(!Category::WindowsOld.safe_to_delete());
         assert!(!Category::InstallerCache.safe_to_delete());
         assert!(!Category::DockerData.safe_to_delete());
+        // Reported so the space is visible, never auto-deleted: one is real
+        // data behind a placeholder, the other needs root and a re-download.
+        assert!(!Category::CloudMirror.safe_to_delete());
+        assert!(!Category::SimulatorRuntimes.safe_to_delete());
+        assert!(!Category::AndroidEmulator.safe_to_delete());
     }
 
     #[test]
@@ -927,7 +1082,9 @@ mod tests {
         assert_eq!(Category::DotNetBuild.slug(), "net-bin-obj");
         assert_eq!(Category::YarnPnpmCache.slug(), "yarn-pnpm-store");
 
-        let all: Vec<String> = crate::report::all_categories().map(|c| c.slug()).collect();
+        let all: Vec<String> = crate::report::all_categories()
+            .map(Category::slug)
+            .collect();
         let mut unique = all.clone();
         unique.sort();
         unique.dedup();

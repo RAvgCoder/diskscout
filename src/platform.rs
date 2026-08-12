@@ -185,6 +185,9 @@ fn installed_software_roots(home: &Path) -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         roots.push(home.join(".npm-global"));
+        // bun's global prefix: the node_modules here backs every `bun add -g`
+        // binary in ~/.bun/bin. Its sibling install/cache is a real cache.
+        roots.push(home.join(".bun/install/global"));
         roots.push(PathBuf::from("/usr/local/lib/node_modules"));
     }
     roots

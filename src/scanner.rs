@@ -608,6 +608,10 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
     let name = entry.file_name().to_str()?;
     let parent = entry.path().parent()?;
 
+    if is_inside_app_bundle(entry.path()) {
+        return None;
+    }
+
     match name {
         "target" => {
             if parent.join("Cargo.toml").exists() || parent.join("Cargo.lock").exists() {
@@ -692,6 +696,15 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
 // An Electron app ships its dependencies inside its own install directory, so
 // the tree looks exactly like a project's `node_modules` -- but deleting it
 // breaks the installed application rather than freeing a rebuildable cache.
+/// Everything inside a macOS bundle ships with the app and is covered by its
+/// code signature, so removing any of it breaks the signature rather than
+/// freeing a rebuildable cache -- an IDE's bundled plugin dependencies and the
+/// bytecode caches of the Python it embeds both live in here.
+fn is_inside_app_bundle(path: &Path) -> bool {
+    path.iter()
+        .any(|c| c.to_str().is_some_and(|c| c.ends_with(".app")))
+}
+
 fn is_packaged_app(path: &Path) -> bool {
     let mut components = path.iter().rev().skip(1); // skip "node_modules"
     let parent = components.next().and_then(|c| c.to_str());
@@ -1053,6 +1066,25 @@ mod tests {
         assert!(!Category::CloudMirror.safe_to_delete());
         assert!(!Category::SimulatorRuntimes.safe_to_delete());
         assert!(!Category::AndroidEmulator.safe_to_delete());
+    }
+
+    // Removing any of it breaks the bundle's code signature, and an IDE ships
+    // both its plugins' dependencies and its embedded Python's bytecode.
+    #[test]
+    fn nothing_inside_an_app_bundle_is_reclaimable() {
+        let td = tempdir().unwrap();
+        let plugin = td
+            .path()
+            .join("Applications/CLion.app/Contents/plugins/vuejs/node_modules");
+        let bytecode = td
+            .path()
+            .join("Applications/CLion.app/Contents/python/lib/__pycache__");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&bytecode).unwrap();
+        fs::write(plugin.parent().unwrap().join("package.json"), "{}").unwrap();
+
+        assert_eq!(classify(td.path(), "node_modules"), None);
+        assert_eq!(classify(td.path(), "__pycache__"), None);
     }
 
     #[test]

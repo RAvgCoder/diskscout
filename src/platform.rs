@@ -59,7 +59,10 @@ pub fn extra_hints() -> &'static [&'static str] {
     }
     #[cfg(not(windows))]
     {
-        &[]
+        &[
+            "Old Rust toolchains: rustup toolchain list, then rustup toolchain uninstall <name>",
+            "Simulator runtimes under /Library need sudo, or: xcrun simctl runtime delete --all",
+        ]
     }
 }
 
@@ -289,6 +292,20 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         (home.join(".cache/uv"), Category::UvCache),
         (home.join("Library/Caches/uv"), Category::UvCache),
         (home.join(".cache/pip"), Category::PipCache),
+        (home.join(".cache/yarn"), Category::YarnPnpmCache),
+        (home.join("Library/Caches/Yarn"), Category::YarnPnpmCache),
+        (
+            home.join(".local/share/pnpm/store"),
+            Category::YarnPnpmCache,
+        ),
+        (home.join("Library/pnpm/store"), Category::YarnPnpmCache),
+        (home.join(".bun/install/cache"), Category::YarnPnpmCache),
+        (home.join(".nuget/packages"), Category::NugetCache),
+        (home.join(".cargo/registry"), Category::CargoRegistry),
+        (home.join(".cargo/git"), Category::CargoRegistry),
+        (home.join(".gradle/caches"), Category::GradleCache),
+        (home.join(".m2/repository"), Category::MavenCache),
+        (home.join("go/pkg/mod"), Category::GoModCache),
     ];
 
     for (path, cat) in candidates {

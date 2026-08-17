@@ -62,6 +62,7 @@ pub fn extra_hints() -> &'static [&'static str] {
         &[
             "Old Rust toolchains: rustup toolchain list, then rustup toolchain uninstall <name>",
             "Simulator runtimes under /Library need sudo, or: xcrun simctl runtime delete --all",
+            "Package manager prefixes are skipped: brew cleanup, conda clean --all",
         ]
     }
 }
@@ -189,7 +190,18 @@ fn installed_software_roots(home: &Path) -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         roots.push(home.join(".npm-global"));
-        roots.push(PathBuf::from("/usr/local/lib/node_modules"));
+        // A package manager's prefix is installed software all the way down.
+        // The node_modules under a Homebrew formula is the CLI that formula
+        // installed, and the __pycache__ under a conda prefix belongs to the
+        // interpreter it shipped. Homebrew uses the first path on Apple
+        // silicon and the second on Intel.
+        roots.push(PathBuf::from("/opt/homebrew"));
+        roots.push(PathBuf::from("/usr/local"));
+        roots.push(PathBuf::from("/opt/local"));
+        for prefix in ["miniconda3", "anaconda3", "miniforge3", "mambaforge"] {
+            roots.push(PathBuf::from("/opt").join(prefix));
+            roots.push(home.join(prefix));
+        }
     }
     roots
 }

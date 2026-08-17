@@ -306,9 +306,14 @@ impl Scanner {
             Vec::new()
         };
 
-        // Those targets are sized directly, so the walker skips them: it avoids
-        // both double-counting and a long crawl through cache trees.
+        // The default skips keep the walk out of places nobody asked about, so
+        // one that contains the requested root would prune the scan before it
+        // started: naming --path /Volumes/disk is a request, not a suggestion.
         let mut skip = platform::skip_paths(&self.config.home);
+        skip.retain(|path| !self.config.root.starts_with(path));
+
+        // The fixed targets are sized directly, so the walker skips them even
+        // then: it avoids both double-counting and a long crawl through caches.
         skip.extend(system.iter().map(|(path, _)| path.clone()));
 
         let spinner = ProgressBar::new_spinner();
@@ -986,6 +991,30 @@ mod tests {
             classify(td.path(), "DerivedData"),
             Some(Category::XcodeDerivedData)
         );
+    }
+
+    // Pointing --path at an external drive used to find nothing at all: the
+    // walk was pruned on its own root because /Volumes is skipped by default.
+    #[test]
+    fn a_requested_root_survives_the_default_skips_that_contain_it() {
+        let skips = [
+            PathBuf::from("/Volumes"),
+            PathBuf::from("/System"),
+            PathBuf::from("/Users/x/Library"),
+        ];
+        let surviving = |root: &str| {
+            skips
+                .iter()
+                .filter(|skip| !Path::new(root).starts_with(skip))
+                .count()
+        };
+
+        // Asking for the drive drops only the rule that would have vetoed it.
+        assert_eq!(surviving("/Volumes/disk"), 2);
+        assert_eq!(surviving("/Users/x/Library/Caches"), 2);
+        // Scanning from the root keeps every skip, since none contains it.
+        assert_eq!(surviving("/"), 3);
+        assert_eq!(surviving("/Users/x"), 3);
     }
 
     #[test]

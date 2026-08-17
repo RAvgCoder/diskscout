@@ -52,6 +52,20 @@ Requires Rust 1.95 or newer (edition 2024). The only dependencies are `walkdir`,
 
 Scanning never writes anything. Deleting only happens behind one of the three delete flags.
 
+### What gets scanned
+
+The walk covers your home directory, not the whole disk. That is deliberate: outside `$HOME`
+almost everything matching a build-artifact pattern belongs to a package manager rather than
+to you. A Homebrew formula's `node_modules` is the CLI that formula installed, and a conda
+prefix's `__pycache__` belongs to the interpreter it shipped, so those prefixes are skipped
+and the report points at `brew cleanup` and `conda clean --all` instead. `/System`, `/dev`
+and the OS caches are skipped for the same reason: they are not yours to delete.
+
+`--path` overrides that. Naming a root explicitly is a request, so a default skip that
+contains it is dropped rather than pruning the scan on its own root, which is what lets
+`--path /Volumes/disk` reach an external drive. Skips that sit *inside* the requested root
+still apply, so `--path /` still leaves `/System` alone.
+
 ### Holding categories back
 
 Every line of the `--delete-safe` preview prints the slug to exclude it:

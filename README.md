@@ -255,7 +255,7 @@ Windows is not covered by that gate, so check it explicitly when touching `platf
 
     cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-Forty-two tests cover directory classification and the marker files it requires, the size
+Forty-four tests cover directory classification and the marker files it requires, the size
 accounting including the sparse and hard-link cases, category slugs and their uniqueness,
 the deletion policy, and each refusal rule above. The rules that exist because something
 broke are pinned by a test naming the failure, so a future change that reintroduces the bug

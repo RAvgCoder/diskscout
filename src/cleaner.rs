@@ -271,10 +271,30 @@ fn clear_readonly(root: &Path) {
     }
 }
 
-// On Unix a denial is an ownership problem that clearing a bit cannot fix, and
-// set_readonly(false) there would widen the mode for everyone.
+// A cache can be deliberately unwritable rather than owned by someone else: Go
+// drops the write bit on every module directory so a build cannot edit its own
+// dependencies, and the delete then fails on the directory, not the file. Only
+// the owner bit is added, so this cannot widen the mode for anyone else, and a
+// denial that really is an ownership problem still fails the retry.
 #[cfg(not(windows))]
-fn clear_readonly(_root: &Path) {}
+fn clear_readonly(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    use walkdir::WalkDir;
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let mode = meta.permissions().mode();
+        if mode & 0o200 == 0 {
+            let _ = fs::set_permissions(entry.path(), fs::Permissions::from_mode(mode | 0o200));
+        }
+    }
+}
 
 fn confirm(prompt: &str) -> bool {
     print!("{prompt}");
@@ -329,6 +349,33 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(freed, 4_096);
         assert!(!trace.exists());
+    }
+
+    // Go marks every module directory read-only, so the whole category failed
+    // with "Permission denied" on a tree the user owns outright.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_deliberately_unwritable_cache_is_still_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("mod");
+        let locked = cache.join("github.com!example/pkg@v1.0.0");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("go.mod"), vec![0u8; 1_024]).unwrap();
+        // Read and execute only, which is exactly how Go leaves them.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (freed, error) = remove(&FoundDir {
+            path: cache.clone(),
+            category: Category::GoModCache,
+            size: 1_024,
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+        });
+
+        assert_eq!(error, None);
+        assert_eq!(freed, 1_024);
+        assert!(!cache.exists());
     }
 
     // A contents-only category keeps the directory the OS expects to exist.

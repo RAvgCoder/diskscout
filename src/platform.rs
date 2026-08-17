@@ -226,10 +226,15 @@ pub fn skip_paths(home: &Path) -> Vec<PathBuf> {
         PathBuf::from("/proc"),
         home.join("Library"),
         home.join(".Trash"),
-        // Every cloud account is mounted here as placeholders. Reading one
-        // downloads the file it stands for, so a walk would pull entire
-        // accounts onto the disk it is supposed to be freeing.
+        // Every cloud account is mounted here as placeholders, iCloud Drive at
+        // the second path. Reading one downloads the file it stands for, so a
+        // walk would pull entire accounts onto the disk it is meant to free.
         home.join("Library").join("CloudStorage"),
+        home.join("Library").join("Mobile Documents"),
+        // Shared between an app and its extensions, which is where a messaging
+        // app keeps the only copy of received media and a podcast app keeps
+        // downloaded episodes, both under a directory named Cache.
+        home.join("Library").join("Group Containers"),
     ];
     skip.extend(installed_software_roots(home));
     skip
@@ -306,10 +311,6 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
             Category::ExpensiveCache,
         ),
         (
-            home.join("Library/Caches/GeoServices"),
-            Category::ExpensiveCache,
-        ),
-        (
             home.join("Library/Containers/com.docker.docker/Data"),
             Category::DockerData,
         ),
@@ -365,12 +366,39 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
-            .map(|path| (path, Category::MacOsCaches))
+            .map(|path| {
+                let category = path
+                    .file_name()
+                    .and_then(|name| held_back_cache(&name.to_string_lossy()))
+                    .unwrap_or(Category::MacOsCaches);
+                (path, category)
+            })
             .collect();
         push_unclaimed(&mut out, per_app);
     }
 
     out
+}
+
+/// Directories under ~/Library/Caches that the name alone gets wrong. The sweep
+/// treats that whole tree as regenerable, which is what it is for, but a few
+/// apps put load-bearing state there and one keeps a cloud account's sync
+/// record in it.
+#[cfg(not(windows))]
+fn held_back_cache(name: &str) -> Option<Category> {
+    match name {
+        // bird is the iCloud Drive sync daemon; this is its working state, not
+        // a blob cache, and it grows to tens of gigabytes on a synced account.
+        "com.apple.bird" | "CloudKit" => Some(Category::CloudMirror),
+        // Offline playlists live in here, so clearing it strands someone who
+        // downloaded them precisely because they expected to be offline.
+        "com.spotify.client" => Some(Category::ExpensiveCache),
+        // Symbol indexes and local history. Deleting costs a full reindex,
+        // which is the same trade DerivedData is already held back for.
+        "JetBrains" => Some(Category::ExpensiveCache),
+        "GeoServices" => Some(Category::ExpensiveCache),
+        _ => None,
+    }
 }
 
 /// A broad sweep must not overwrite a category a specific rule already assigned,
@@ -450,6 +478,10 @@ fn instruments_traces() -> Vec<(PathBuf, Category)> {
 
 /// The directory names Chromium uses for its caches, identical under every
 /// Electron app, browser profile and session partition, on every platform.
+///
+/// `Local Storage`, `Session Storage` and `IndexedDB` sit beside these and look
+/// just like them. They hold an app's offline documents and unsent work, so
+/// nothing may be added here without checking which of the two it is.
 const WEB_CACHE_DIRS: &[&str] = &[
     "Cache",
     "CachedData",
@@ -484,20 +516,30 @@ fn collect_web_caches(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, Category)>
 
     for entry in entries.flatten() {
         // read_dir reports a symlink as a symlink, so this cannot follow one
-        // out of Application Support or into a cycle.
+        // out of the app data root or into a cycle.
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        if WEB_CACHE_DIRS
-            .iter()
-            .any(|name| entry.file_name() == **name)
-        {
+        let name = entry.file_name();
+        if NEVER_SWEEP.iter().any(|tree| name == **tree) {
+            continue;
+        }
+        if WEB_CACHE_DIRS.iter().any(|cache| name == **cache) {
             out.push((entry.path(), Category::AppWebCache));
         } else if depth > 0 {
             collect_web_caches(&entry.path(), depth - 1, out);
         }
     }
 }
+
+/// Trees whose children carry cache-shaped names over real user data: Store app
+/// data on Windows, and the group and cloud roots on macOS.
+const NEVER_SWEEP: &[&str] = &[
+    "Packages",
+    "Group Containers",
+    "CloudStorage",
+    "Mobile Documents",
+];
 
 /// Bundle identifiers hosting a File Provider extension. What looks like a
 /// cache inside one of these containers is the provider's record of the local
@@ -637,6 +679,10 @@ pub fn skip_paths(home: &Path) -> Vec<PathBuf> {
         local.join("Temp"),
         // Zero-byte reparse stubs pointing at Store app installs.
         local.join("Microsoft").join("WindowsApps"),
+        // Store app data. LocalCache here is documented as persistent storage
+        // the app manages itself, not the OS-purgeable TemporaryFolder beside
+        // it, and Store apps keep real downloaded content in it.
+        local.join("Packages"),
     ];
     skip.extend(installed_software_roots(home));
     skip
@@ -739,6 +785,23 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         (local.join("wsl"), DockerData),
         (local.join("Android").join("Sdk"), AndroidSdk),
         (home.join(".android").join("avd"), AndroidEmulator),
+        // Sync engines, claimed ahead of the Electron sweep below so a Cache
+        // directory found inside one is dropped as nested rather than deleted.
+        // Windows has no equivalent of pluginkit, and the registry's sync-root
+        // list misses the providers that ship their own virtual filesystem, so
+        // these are named. DriveFS is the same content cache and metadata
+        // database whose macOS twin cost a 340 GB re-download.
+        (local.join("Google").join("DriveFS"), CloudMirror),
+        (
+            local.join("Microsoft").join("OneDrive").join("settings"),
+            CloudMirror,
+        ),
+        (local.join("Dropbox"), CloudMirror),
+        (local.join("Box"), CloudMirror),
+        (local.join("Apple Inc"), CloudMirror),
+        // Co-authoring state for open documents. Microsoft's own guidance is
+        // that deleting these by hand breaks Office rather than freeing space.
+        (local.join("Microsoft").join("Office"), ExpensiveCache),
     ];
 
     let mut out: Vec<(PathBuf, Category)> =
@@ -1098,5 +1161,40 @@ mod target_tests {
     #[test]
     fn a_sync_container_is_never_offered_for_deletion() {
         assert!(!Category::CloudMirror.safe_to_delete());
+    }
+
+    // ~/Library/Caches is regenerable by definition, which is why the sweep
+    // takes all of it; these are the entries where that is simply untrue.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_caches_that_are_not_caches_keep_their_own_category() {
+        assert_eq!(
+            held_back_cache("com.apple.bird"),
+            Some(Category::CloudMirror)
+        );
+        assert_eq!(
+            held_back_cache("com.spotify.client"),
+            Some(Category::ExpensiveCache)
+        );
+        assert_eq!(held_back_cache("JetBrains"), Some(Category::ExpensiveCache));
+        assert_eq!(held_back_cache("org.swift.swiftpm"), None);
+    }
+
+    #[test]
+    fn the_sweep_refuses_to_enter_a_tree_of_real_user_data() {
+        let dir = tempfile::tempdir().unwrap();
+        // A podcast app keeps downloaded episodes under a directory named Cache.
+        let episodes = dir
+            .path()
+            .join("Group Containers/groups.com.apple.podcasts/Library/Cache");
+        // A Store app's LocalCache is documented as persistent storage.
+        let store = dir.path().join("Packages/SomeApp_8wekyb/Cache");
+        for path in [&episodes, &store] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        let found = app_web_caches(std::slice::from_ref(&dir.path().to_path_buf()));
+
+        assert!(found.is_empty(), "{found:?}");
     }
 }

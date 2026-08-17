@@ -393,9 +393,6 @@ fn held_back_cache(name: &str) -> Option<Category> {
         // Offline playlists live in here, so clearing it strands someone who
         // downloaded them precisely because they expected to be offline.
         "com.spotify.client" => Some(Category::ExpensiveCache),
-        // Symbol indexes and local history. Deleting costs a full reindex,
-        // which is the same trade DerivedData is already held back for.
-        "JetBrains" => Some(Category::ExpensiveCache),
         "GeoServices" => Some(Category::ExpensiveCache),
         _ => None,
     }
@@ -1176,8 +1173,10 @@ mod target_tests {
             held_back_cache("com.spotify.client"),
             Some(Category::ExpensiveCache)
         );
-        assert_eq!(held_back_cache("JetBrains"), Some(Category::ExpensiveCache));
         assert_eq!(held_back_cache("org.swift.swiftpm"), None);
+        // An IDE index costs a reindex and nothing else, which is the trade the
+        // sweep exists to make, and Windows already treats it that way.
+        assert_eq!(held_back_cache("JetBrains"), None);
     }
 
     #[test]

@@ -177,8 +177,9 @@ documented as storage the app manages itself, not the purgeable directory beside
 **Caches that cost more than a download.** Photo and media analysis run over the whole
 library, so clearing them buys a few hundred megabytes and spends hours of CPU re-deriving
 what was already there. Siri's downloaded voices, offline map tiles, Spotify's offline
-playlists, JetBrains' symbol indexes and Office's co-authoring state are the same trade in
-bandwidth or rebuild time. Reported, never swept.
+playlists and Office's co-authoring state are the same trade in bandwidth. Reported, never
+swept. An IDE index is deliberately not in that set: rebuilding it is exactly the trade the
+sweep exists to make.
 
 `~/Library/Caches` is regenerable by definition and the sweep takes all of it, so the few
 entries where that is untrue are named individually rather than assumed.

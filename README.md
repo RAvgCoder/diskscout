@@ -157,20 +157,31 @@ real cache and stays deletable.
 
 **A cloud provider's sync state.** What looks like a cache inside a File Provider
 extension's container is the provider's record of the local mirror. Clearing Google Drive's
-made it treat every synced file as unknown and re-download the whole account. The
-containers belonging to iCloud, OneDrive, Drive and anything installed later are identified
-from `pluginkit`, which is the registry macOS itself keeps, so no vendor list is involved.
-If that lookup gives no answer, no container is swept at all: there is no safe way to tell
-a cache from a sync root without it.
+made it treat every synced file as unknown, re-download the whole account, and quarantine
+what it could not reconcile. On macOS the containers belonging to iCloud, OneDrive, Drive
+and anything installed later are identified from `pluginkit`, the registry macOS itself
+keeps, so no vendor list is involved; if that lookup gives no answer, no container is swept
+at all. Windows has no equivalent, and the registry's sync-root list misses providers that
+ship their own virtual filesystem, so there the paths are named.
 
-**`~/Library/CloudStorage`.** Every cloud account is mounted there as placeholders. Reading
-one downloads the file it stands for, so walking it would pull entire accounts onto the disk
-the tool is supposed to be freeing.
+**Anywhere a placeholder lives.** `~/Library/CloudStorage` and `~/Library/Mobile Documents`
+are where every cloud account is mounted. Reading a placeholder downloads the file it
+stands for, so walking those would pull entire accounts onto the disk the tool is supposed
+to be freeing.
+
+**Group containers, and Store app data on Windows.** A messaging app keeps the only copy of
+every photo it ever received in its group container, and a podcast app keeps downloaded
+episodes in a directory it named `Cache`. On Windows, `LocalCache` under `Packages` is
+documented as storage the app manages itself, not the purgeable directory beside it.
 
 **Caches that cost more than a download.** Photo and media analysis run over the whole
 library, so clearing them buys a few hundred megabytes and spends hours of CPU re-deriving
-what was already there. Siri's downloaded voices and offline map tiles are the same trade in
-bandwidth. Reported, never swept.
+what was already there. Siri's downloaded voices, offline map tiles, Spotify's offline
+playlists, JetBrains' symbol indexes and Office's co-authoring state are the same trade in
+bandwidth or rebuild time. Reported, never swept.
+
+`~/Library/Caches` is regenerable by definition and the sweep takes all of it, so the few
+entries where that is untrue are named individually rather than assumed.
 
 ## How sizes are measured
 
@@ -209,7 +220,7 @@ big is this file really.
 | On-disk size | `st_blocks * 512` | `GetCompressedFileSizeW` |
 | Cloud placeholders | not detected | `FILE_ATTRIBUTE_OFFLINE` and recall flags |
 | Hard links | counted once | counted per link, no stable file index in std |
-| Sync roots | `pluginkit` File Provider registry | not yet detected |
+| Sync roots | `pluginkit` File Provider registry | named paths, no registry query |
 | Report path | `/tmp` | `%TEMP%` |
 | Completions | zsh, bash, fish | PowerShell |
 
@@ -229,7 +240,7 @@ Windows is not covered by that gate, so check it explicitly when touching `platf
 
     cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-Forty tests cover directory classification and the marker files it requires, the size
+Forty-two tests cover directory classification and the marker files it requires, the size
 accounting including the sparse and hard-link cases, category slugs and their uniqueness,
 the deletion policy, and each refusal rule above. The rules that exist because something
 broke are pinned by a test naming the failure, so a future change that reintroduces the bug

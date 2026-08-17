@@ -1,0 +1,9 @@
+## v0.1.0
+
+diskscout is a command-line tool that finds reclaimable disk space on developer machines and deletes it safely, on macOS and Windows alike. It walks the filesystem looking for build artifacts, package manager caches, and other regenerable data — Gradle, Cargo, Maven, Go, NuGet, yarn/pnpm, browser caches, IDE indexes, and dozens more — and reports what's taking up space, broken down by category rather than as one opaque total.
+
+The core of the project is knowing what *not* to touch. Cloud sync state for Google Drive, OneDrive, iCloud, and Dropbox is identified and left alone rather than treated as an ordinary cache, since clearing it can force multi-hundred-gigabyte re-downloads or strand offline-only files. Installed software is protected too: Homebrew and other package manager prefixes, `.app` bundles, and tool install directories (bun, npm globals) are recognized as shipped code rather than build output, even when their contents look identical to a disposable `node_modules` tree. A separate "review-carefully" category holds back caches that are technically regenerable but expensive to rebuild — photo and media analysis, Siri voices, offline map tiles — so they're reported but never deleted without being asked for by name.
+
+Sizing is done carefully as well: sparse files, hard links, OneDrive placeholders, and nested build targets are all accounted for so the space a scan promises is the space a delete can actually return. Deletion itself is driven by `--delete-safe`, with `--except` to exclude specific categories and `-y` to skip the confirmation prompt, and live OS directories are emptied in place rather than removed outright.
+
+This first tagged release brings the tool to feature parity across both major desktop platforms, backed by a CI gate, dependency audit, and an initial test suite, with a README documenting how the safety model works and where the macOS and Windows behavior diverges.

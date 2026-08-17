@@ -176,6 +176,10 @@ fn installed_software_roots(home: &Path) -> Vec<PathBuf> {
         home.join(".vscode-server").join("extensions"),
         home.join(".cursor").join("extensions"),
         home.join(".windsurf").join("extensions"),
+        // bun's global prefix, same layout on every platform: the node_modules
+        // here backs every binary in ~/.bun/bin, while its sibling
+        // install/cache is a real cache and stays deletable.
+        home.join(".bun").join("install").join("global"),
     ];
     #[cfg(windows)]
     {
@@ -185,9 +189,6 @@ fn installed_software_roots(home: &Path) -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         roots.push(home.join(".npm-global"));
-        // bun's global prefix: the node_modules here backs every `bun add -g`
-        // binary in ~/.bun/bin. Its sibling install/cache is a real cache.
-        roots.push(home.join(".bun/install/global"));
         roots.push(PathBuf::from("/usr/local/lib/node_modules"));
     }
     roots
@@ -225,6 +226,10 @@ pub fn skip_paths(home: &Path) -> Vec<PathBuf> {
         PathBuf::from("/proc"),
         home.join("Library"),
         home.join(".Trash"),
+        // Every cloud account is mounted here as placeholders. Reading one
+        // downloads the file it stands for, so a walk would pull entire
+        // accounts onto the disk it is supposed to be freeing.
+        home.join("Library").join("CloudStorage"),
     ];
     skip.extend(installed_software_roots(home));
     skip
@@ -337,7 +342,7 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     }
 
     push_unclaimed(&mut out, instruments_traces());
-    push_unclaimed(&mut out, app_web_caches(&support));
+    push_unclaimed(&mut out, app_web_caches(std::slice::from_ref(&support)));
     push_unclaimed(&mut out, container_caches(home));
 
     if let Ok(out_bytes) = std::process::Command::new("brew").arg("--cache").output()
@@ -370,7 +375,6 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
 
 /// A broad sweep must not overwrite a category a specific rule already assigned,
 /// or a path deliberately held back would come back as deletable.
-#[cfg(not(windows))]
 fn push_unclaimed(out: &mut Vec<(PathBuf, Category)>, found: Vec<(PathBuf, Category)>) {
     for (path, category) in found {
         if !out.iter().any(|(claimed, _)| claimed == &path) {
@@ -445,8 +449,7 @@ fn instruments_traces() -> Vec<(PathBuf, Category)> {
 }
 
 /// The directory names Chromium uses for its caches, identical under every
-/// Electron app, browser profile and session partition.
-#[cfg(not(windows))]
+/// Electron app, browser profile and session partition, on every platform.
 const WEB_CACHE_DIRS: &[&str] = &[
     "Cache",
     "CachedData",
@@ -461,17 +464,19 @@ const WEB_CACHE_DIRS: &[&str] = &[
     "component_crx_cache",
 ];
 
-#[cfg(not(windows))]
-fn app_web_caches(support: &Path) -> Vec<(PathBuf, Category)> {
+/// Every Electron app keeps its caches under the platform's per-app data root:
+/// Application Support on macOS, %APPDATA% and %LOCALAPPDATA% on Windows.
+fn app_web_caches(roots: &[PathBuf]) -> Vec<(PathBuf, Category)> {
     let mut out = Vec::new();
-    // Deep enough for <app>/Partitions/<session>/Cache and <browser>/<profile>/Cache.
-    collect_web_caches(support, 3, &mut out);
+    for root in roots {
+        // Deep enough for <app>/Partitions/<session>/Cache and <browser>/<profile>/Cache.
+        collect_web_caches(root, 3, &mut out);
+    }
     out
 }
 
 /// Matching on the name finds every Electron app's cache without naming one.
 /// A matched directory is never descended into, so nothing is counted twice.
-#[cfg(not(windows))]
 fn collect_web_caches(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, Category)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -494,19 +499,71 @@ fn collect_web_caches(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, Category)>
     }
 }
 
+/// Bundle identifiers hosting a File Provider extension. What looks like a
+/// cache inside one of these containers is the provider's record of the local
+/// mirror, so clearing it makes the provider treat every synced file as unknown
+/// and re-download the account. `pluginkit` is the registry macOS itself keeps,
+/// which identifies iCloud, OneDrive, Drive and the rest without naming vendors.
+#[cfg(not(windows))]
+fn file_provider_bundles() -> Option<Vec<String>> {
+    let out = std::process::Command::new("pluginkit")
+        .args(["-m", "-p", "com.apple.fileprovider-nonui"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            // Each line is "    <bundle-id>(<version>)".
+            .filter_map(|line| line.split('(').next())
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect(),
+    )
+}
+
+/// True when the container belongs to a sync provider, matching the extension's
+/// own identifier and the parent app that ships it.
+#[cfg(not(windows))]
+fn is_sync_container(name: &str, providers: &[String]) -> bool {
+    providers.iter().any(|id| {
+        id == name || id.starts_with(&format!("{name}.")) || name.starts_with(&format!("{id}."))
+    })
+}
+
 /// A sandboxed app caches inside its container rather than in ~/Library/Caches,
-/// so scanning that one directory never sees any of it.
+/// so scanning that one directory never sees any of it. A sync provider's
+/// container is reported but never swept: losing it costs a full re-download.
 #[cfg(not(windows))]
 fn container_caches(home: &Path) -> Vec<(PathBuf, Category)> {
-    let Ok(entries) = std::fs::read_dir(home.join("Library/Containers")) else {
+    // No answer from pluginkit means no way to tell a cache from a sync root,
+    // and guessing wrong re-downloads an entire cloud account.
+    let Some(providers) = file_provider_bundles() else {
+        return Vec::new();
+    };
+    container_caches_in(&home.join("Library/Containers"), &providers)
+}
+
+#[cfg(not(windows))]
+fn container_caches_in(containers: &Path, providers: &[String]) -> Vec<(PathBuf, Category)> {
+    let Ok(entries) = std::fs::read_dir(containers) else {
         return Vec::new();
     };
 
     entries
         .flatten()
-        .map(|entry| entry.path().join("Data/Library/Caches"))
-        .filter(|path| path.is_dir())
-        .map(|path| (path, Category::ContainerCaches))
+        .filter_map(|entry| {
+            let category = if is_sync_container(&entry.file_name().to_string_lossy(), providers) {
+                Category::CloudMirror
+            } else {
+                Category::ContainerCaches
+            };
+            let path = entry.path().join("Data/Library/Caches");
+            path.is_dir().then_some((path, category))
+        })
         .collect()
 }
 
@@ -681,7 +738,7 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         (local.join("Docker").join("wsl"), DockerData),
         (local.join("wsl"), DockerData),
         (local.join("Android").join("Sdk"), AndroidSdk),
-        (home.join(".android").join("avd"), AndroidSdk),
+        (home.join(".android").join("avd"), AndroidEmulator),
     ];
 
     let mut out: Vec<(PathBuf, Category)> =
@@ -714,6 +771,11 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
         &local.join("Mozilla").join("Firefox").join("Profiles"),
         &mut out,
     );
+
+    // Every Electron app keeps a Chromium cache tree under one of these two,
+    // and none of them is a browser the named sweep above knows about. Runs
+    // last so a path an earlier rule claimed keeps its category.
+    push_unclaimed(&mut out, app_web_caches(&[roaming, local]));
 
     out
 }
@@ -898,7 +960,7 @@ mod size_tests {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod target_tests {
     use super::*;
 
@@ -917,7 +979,7 @@ mod target_tests {
         // Chromium nests a directory of the same name inside the cache itself.
         std::fs::create_dir_all(plain.join("Cache")).unwrap();
 
-        let found: Vec<PathBuf> = app_web_caches(support)
+        let found: Vec<PathBuf> = app_web_caches(&[support.to_path_buf()])
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -931,6 +993,36 @@ mod target_tests {
         );
     }
 
+    // The exact shape that re-downloaded a 340 GB Drive account: the provider's
+    // container sits beside ordinary app containers and looks identical.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_sync_providers_cache_is_reported_but_not_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let containers = dir.path();
+        for id in ["com.google.drivefs.fpext", "com.spotify.client"] {
+            std::fs::create_dir_all(containers.join(id).join("Data/Library/Caches")).unwrap();
+        }
+
+        let found = container_caches_in(containers, &["com.google.drivefs.fpext".to_owned()]);
+
+        let category = |id: &str| {
+            found
+                .iter()
+                .find(|(path, _)| path.starts_with(containers.join(id)))
+                .map(|(_, category)| *category)
+        };
+        assert_eq!(
+            category("com.google.drivefs.fpext"),
+            Some(Category::CloudMirror)
+        );
+        assert_eq!(
+            category("com.spotify.client"),
+            Some(Category::ContainerCaches)
+        );
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn a_containers_cache_is_found_only_at_the_sandbox_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -941,7 +1033,10 @@ mod target_tests {
         // A container that keeps no cache contributes nothing.
         std::fs::create_dir_all(containers.join("com.empty.app/Data")).unwrap();
 
-        let found: Vec<PathBuf> = container_caches(home).into_iter().map(|(p, _)| p).collect();
+        let found: Vec<PathBuf> = container_caches_in(&containers, &[])
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
 
         assert_eq!(found, vec![real]);
     }
@@ -975,5 +1070,33 @@ mod target_tests {
     fn the_protected_caches_are_never_auto_deleted() {
         assert!(!Category::ExpensiveCache.safe_to_delete());
         assert!(Category::ExpensiveCache.delete_contents_only());
+    }
+
+    // The container that cost a 340 GB re-download, plus the shapes around it:
+    // the extension's own container, the app that ships it, and an unrelated
+    // app that merely shares a name prefix.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_sync_providers_container_is_recognised_from_its_extension() {
+        let providers = [
+            "com.google.drivefs.fpext".to_owned(),
+            "com.microsoft.OneDrive-mac.FileProvider".to_owned(),
+            "com.apple.CloudDocs.iCloudDriveFileProvider".to_owned(),
+        ];
+
+        assert!(is_sync_container("com.google.drivefs.fpext", &providers));
+        assert!(is_sync_container("com.google.drivefs", &providers));
+        assert!(is_sync_container("com.microsoft.OneDrive-mac", &providers));
+        assert!(is_sync_container("com.apple.CloudDocs", &providers));
+
+        assert!(!is_sync_container("com.spotify.client", &providers));
+        assert!(!is_sync_container("com.apple.Safari", &providers));
+        // A prefix that is not a whole identifier segment is a different app.
+        assert!(!is_sync_container("com.google.drivefsOther", &providers));
+    }
+
+    #[test]
+    fn a_sync_container_is_never_offered_for_deletion() {
+        assert!(!Category::CloudMirror.safe_to_delete());
     }
 }

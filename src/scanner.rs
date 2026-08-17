@@ -284,20 +284,6 @@ impl Scanner {
         Self { config }
     }
 
-    // The fixed OS targets are sized directly, so the walker skips them: it
-    // avoids both double-counting and a long crawl through cache trees.
-    fn skip_paths(&self) -> Vec<PathBuf> {
-        let mut skip = platform::skip_paths(&self.config.home);
-        if self.config.include_system {
-            skip.extend(
-                platform::system_targets(&self.config.home)
-                    .into_iter()
-                    .map(|(path, _)| path),
-            );
-        }
-        skip
-    }
-
     pub fn scan(&self) -> ScanResult {
         let err_count = AtomicUsize::new(0);
         let mut pending: Vec<(PathBuf, Category)> = Vec::new();
@@ -311,7 +297,19 @@ impl Scanner {
             old_min: 10 * 1_048_576,
         };
 
-        let skip = self.skip_paths();
+        // Enumerating the fixed targets reads hundreds of directories and shells
+        // out to the package managers, so it happens once and every later pass
+        // works from the same answer.
+        let system: Vec<(PathBuf, Category)> = if self.config.include_system {
+            platform::system_targets(&self.config.home)
+        } else {
+            Vec::new()
+        };
+
+        // Those targets are sized directly, so the walker skips them: it avoids
+        // both double-counting and a long crawl through cache trees.
+        let mut skip = platform::skip_paths(&self.config.home);
+        skip.extend(system.iter().map(|(path, _)| path.clone()));
 
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
@@ -373,9 +371,7 @@ impl Scanner {
 
         spinner.finish_and_clear();
 
-        if self.config.include_system {
-            pending.extend(platform::system_targets(&self.config.home));
-        }
+        pending.extend(system);
         pending.extend(platform::build_cache_targets(&self.config.home));
 
         let pending = keep_outermost(pending);
@@ -420,7 +416,7 @@ impl Scanner {
 
         disk_images.sort_by_key(|f| Reverse(f.size));
 
-        let large_unknown_dirs = self.scan_unknown_large_dirs(&dirs);
+        let large_unknown_dirs = self.scan_unknown_large_dirs(&dirs, &skip);
 
         ScanResult {
             dirs,
@@ -436,9 +432,7 @@ impl Scanner {
     // Second pass: walk to depth 4 looking for large dirs not covered by any
     // known category. Surfaces things like VM images, model weights, forgotten
     // project archives -- anything the pattern matcher wouldn't catch.
-    fn scan_unknown_large_dirs(&self, categorized: &[FoundDir]) -> Vec<LargeDir> {
-        let skip = self.skip_paths();
-
+    fn scan_unknown_large_dirs(&self, categorized: &[FoundDir], skip: &[PathBuf]) -> Vec<LargeDir> {
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg}")

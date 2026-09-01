@@ -286,22 +286,51 @@ fn write_completions() -> Result<(), String> {
 /// location for whichever edition answered.
 #[cfg(windows)]
 fn powershell_profile(home: &Path) -> PathBuf {
+    // PowerShell encodes a redirected stdout with the console codepage it
+    // inherited, not UTF-8, and `Command::output` always redirects. When
+    // OneDrive has redirected Documents to a localised name that codepage
+    // cannot represent -- `المستندات` on an Arabic profile, and the same for
+    // CJK or Cyrillic -- each such character arrives as `?`. That is not a
+    // legal Windows path character, so the completions mkdir failed with "The
+    // filename, directory name, or volume label syntax is incorrect" (os error
+    // 123) and the install stopped one step short of done. Pinning the child's
+    // output encoding is what makes the answer survive the pipe.
+    const QUERY: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $PROFILE";
+
     for exe in ["pwsh", "powershell"] {
         let out = Command::new(exe)
-            .args(["-NoProfile", "-NonInteractive", "-Command", "$PROFILE"])
+            .args(["-NoProfile", "-NonInteractive", "-Command", QUERY])
             .output();
         if let Ok(out) = out
             && out.status.success()
+            && let Some(path) = parse_profile_answer(&out.stdout)
         {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() {
-                return PathBuf::from(path);
-            }
+            return path;
         }
     }
     home.join("Documents")
         .join("WindowsPowerShell")
         .join("Microsoft.PowerShell_profile.ps1")
+}
+
+/// Decodes a `$PROFILE` answer, rejecting one that did not survive the pipe.
+///
+/// A lossy encoding is not a recoverable error: the characters are already
+/// gone, and the mangling leaves behind a string that still looks like a path.
+/// Taking it would create a directory named after the damage and write
+/// completions somewhere PowerShell never loads them, so a mangled answer is
+/// refused and the caller falls through to the next candidate instead.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_profile_answer(stdout: &[u8]) -> Option<PathBuf> {
+    let answer = String::from_utf8_lossy(stdout);
+    let answer = answer.trim();
+    // `?` and friends are the codepage substitution; U+FFFD is what
+    // `from_utf8_lossy` leaves when the bytes were some other encoding
+    // entirely. Neither can appear in a path PowerShell actually reported.
+    if answer.is_empty() || answer.contains(['?', '*', '<', '>', '|', '"', '\u{FFFD}']) {
+        return None;
+    }
+    Some(PathBuf::from(answer))
 }
 
 #[cfg(not(windows))]
@@ -419,5 +448,47 @@ fn expand_tilde(s: &str) -> PathBuf {
             crate::platform::home_dir().map_or_else(|| PathBuf::from(s), |h| h.join(rest))
         }
         None => PathBuf::from(s),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARABIC_DOCUMENTS: &str = "المستندات";
+
+    #[test]
+    fn profile_answer_keeps_a_non_ascii_documents_folder() {
+        let answer = format!(
+            "C:\\Users\\u\\OneDrive\\{ARABIC_DOCUMENTS}\\PowerShell\\Microsoft.PowerShell_profile.ps1\r\n"
+        );
+        let got = parse_profile_answer(answer.as_bytes()).expect("a clean answer is accepted");
+        assert!(got.to_string_lossy().contains(ARABIC_DOCUMENTS));
+    }
+
+    /// Pins the install failure: PowerShell encoded the pipe with the console
+    /// codepage, an Arabic Documents folder came back as `?????????`, and the
+    /// completions mkdir died with os error 123.
+    #[test]
+    fn profile_answer_mangled_by_the_console_codepage_is_rejected() {
+        let mangled =
+            "C:\\Users\\u\\OneDrive\\?????????\\PowerShell\\Microsoft.PowerShell_profile.ps1\r\n";
+        assert!(parse_profile_answer(mangled.as_bytes()).is_none());
+    }
+
+    /// The other half of the same failure: bytes in some non-UTF-8 encoding
+    /// rather than substituted characters. Here CP1256 for `المستندات`.
+    #[test]
+    fn profile_answer_that_is_not_utf8_is_rejected() {
+        let mut bytes = b"C:\\Users\\u\\OneDrive\\".to_vec();
+        bytes.extend_from_slice(&[0xc7, 0xe1, 0xe3, 0xd3, 0xca, 0xe4, 0xcf, 0xc7, 0xca]);
+        bytes.extend_from_slice(b"\\PowerShell\\Microsoft.PowerShell_profile.ps1\r\n");
+        assert!(parse_profile_answer(&bytes).is_none());
+    }
+
+    #[test]
+    fn empty_profile_answer_is_rejected() {
+        assert!(parse_profile_answer(b"  \r\n").is_none());
+        assert!(parse_profile_answer(b"").is_none());
     }
 }

@@ -35,8 +35,9 @@ Requires Rust 1.95 or newer (edition 2024). The only dependencies are `walkdir`,
 
 Builds a standalone Apple silicon binary and zips it with an installer and a plain-text
 README, for a Mac that has neither this repo nor a Rust toolchain. Unzip, then
-`bash install.sh`. It installs to `~/.local/bin` without a password, adds that to `PATH`,
-sets up tab completion, and refuses a copy whose checksum does not match.
+`bash install.sh`. It copies the binary into `/usr/local/bin`, which `/etc/paths` already
+puts on every Mac's `PATH`, so it edits no shell config and adds nothing to shell startup.
+It refuses a copy whose checksum does not match.
 
 The binary targets the M1 instruction set and macOS 11.0, the oldest macOS any Apple
 silicon Mac shipped with, so it runs on every one of them regardless of which chip built

@@ -13,7 +13,7 @@ INSTALL
 
          bash install.sh
 
-  4. Open a new Terminal window.
+     It asks for your Mac password, to copy diskscout into /usr/local/bin.
 
 Run it with "bash install.sh" rather than double-clicking. macOS blocks
 programs that were not downloaded from the App Store or checked by Apple, and
@@ -40,5 +40,5 @@ USE
 
 UNINSTALL
 
-  Delete the file ~/.local/bin/diskscout
-  Optionally remove the lines starting "# diskscout" from ~/.zshrc.
+  In Finder choose Go > Go to Folder, enter /usr/local/bin, and move
+  diskscout to the Trash. Nothing else was installed or changed.

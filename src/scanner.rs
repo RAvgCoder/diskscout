@@ -42,6 +42,7 @@ pub enum Category {
     IphoneBackups,
     // Per-application state outside the walk.
     AppWebCache,
+    BrowserCache,
     ContainerCaches,
     ExpensiveCache,
     CloudMirror,
@@ -54,7 +55,6 @@ pub enum Category {
     WindowsCaches,
     ThumbnailCache,
     InstallerCache,
-    BrowserCache,
     // Package and tool caches.
     NpmCache,
     YarnPnpmCache,
@@ -152,7 +152,6 @@ impl Category {
                 | Category::CrashDumps
                 | Category::WindowsCaches
                 | Category::ThumbnailCache
-                | Category::BrowserCache
                 | Category::NpmCache
                 | Category::YarnPnpmCache
                 | Category::HomebrewCache
@@ -1089,6 +1088,8 @@ mod tests {
         assert!(!Category::CloudMirror.safe_to_delete());
         assert!(!Category::SimulatorRuntimes.safe_to_delete());
         assert!(!Category::AndroidEmulator.safe_to_delete());
+        // Nothing personal lives in them, but they are held back on request.
+        assert!(!Category::BrowserCache.safe_to_delete());
     }
 
     // Removing any of it breaks the bundle's code signature, and an IDE ships

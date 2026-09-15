@@ -116,14 +116,14 @@ not descended into, so a 4 GB `node_modules` is one entry rather than 30,000.
 simulators and their runtimes, per-OS device support, the documentation cache, Instruments
 recordings, `~/Library/Caches` broken out one entry per app, and iPhone backups.
 
-**App data and caches** covers the Chromium cache directories every Electron app and
-browser profile carries, sandboxed apps' caches inside their own containers, the local
-mirror a cloud provider keeps, and a small set whose contents cost hours of CPU rather than
-a download to rebuild.
+**App data and caches** covers the Chromium cache directories every Electron app carries,
+browser caches, sandboxed apps' caches inside their own containers, the local mirror a
+cloud provider keeps, and a small set whose contents cost hours of CPU rather than a
+download to rebuild.
 
 **Windows system** covers `%TEMP%`, Windows Update and servicing leftovers, `Windows.old`,
 the recycle bin on every fixed drive, crash dumps, shell and shader caches, the thumbnail
-cache, the installer payload cache and per-profile browser caches.
+cache and the installer payload cache.
 
 **Package and tool caches** covers npm, yarn, pnpm and bun, Homebrew, uv, pip, NuGet, the
 Cargo registry, Gradle, Maven, Go modules and IDE caches.
@@ -155,19 +155,20 @@ cache directories rather than the top eight.
 
 Deletion is permanent. Not the Trash, no undo.
 
-Thirty-two of the forty-eight categories are tagged **safe to delete**: regenerable on
+Thirty-one of the forty-eight categories are tagged **safe to delete**: regenerable on
 demand, costing a rebuild or a re-download but never data. `--delete-safe` takes exactly
 these.
 
-The other sixteen are tagged **review carefully** and `--delete-safe` never touches them,
+The other seventeen are tagged **review carefully** and `--delete-safe` never touches them,
 whatever `--except` says. Virtualenvs, framework build directories, DerivedData, simulators
-and their runtimes, iPhone backups, the cloud mirror, the caches that cost hours to rebuild,
+and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
+hours to rebuild,
 `Windows.old`, the installer payload cache still needed to repair or uninstall, Docker and
 WSL data, the Android SDK and emulator images. They are still measured and still reported,
 because knowing where the space went is useful even when removing it is your call.
 
 Directories the OS and running apps expect to keep existing are emptied rather than removed:
-`%TEMP%`, the browser caches, an app's own cache directory. A cache with open handles
+`%TEMP%`, an app's own cache directory. A cache with open handles
 deletes partially, and the report says how much actually came back rather than assuming the
 whole figure did.
 
@@ -205,6 +206,23 @@ to be freeing.
 every photo it ever received in its group container, and a podcast app keeps downloaded
 episodes in a directory it named `Cache`. On Windows, `LocalCache` under `Packages` is
 documented as storage the app manages itself, not the purgeable directory beside it.
+
+**Browser caches.** Chrome, Edge, Firefox, Safari, Brave, Arc, Opera, Vivaldi and
+Chromium keep nothing personal in them, since logins, history and bookmarks live in the
+profile beside them, but they are held back on request and reported instead. A vendor
+folder is split rather than taken whole: `~/Library/Caches/Google` holds Chrome beside
+Android Studio, so Android Studio's cache still goes and Chrome's stays. Safari keeps most
+of its cache inside its sandbox container, which is held back too.
+
+**A service worker's registrations.** Only the `CacheStorage` inside an app's
+`Service Worker` directory is swept. The `Database` beside it holds the registrations web
+push and offline apps rely on, and it is a few hundred kilobytes against gigabytes of
+`CacheStorage`.
+
+**A runtime version manager's toolchains.** An nvm Node version's `lib/node_modules` is npm
+and corepack themselves, and a pyenv Python's `__pycache__` belongs to its standard
+library. nvm, fnm, Volta, nodenv, asdf, rbenv, mise and pyenv are never walked, nor Scoop
+and per-user installs under `%LOCALAPPDATA%\Programs` on Windows.
 
 **Caches that cost more than a download.** Photo and media analysis run over the whole
 library, so clearing them buys a few hundred megabytes and spends hours of CPU re-deriving
@@ -273,7 +291,7 @@ Windows is not covered by that gate, so check it explicitly when touching `platf
 
     cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-Forty-four tests cover directory classification and the marker files it requires, the size
+Fifty tests cover directory classification and the marker files it requires, the size
 accounting including the sparse and hard-link cases, category slugs and their uniqueness,
 the deletion policy, and each refusal rule above. The rules that exist because something
 broke are pinned by a test naming the failure, so a future change that reintroduces the bug

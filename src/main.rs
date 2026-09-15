@@ -57,7 +57,7 @@ struct ScanArgs {
     #[arg(long, short = 'y')]
     yes: bool,
 
-    /// Categories --delete-safe must leave alone, e.g. --except browser-caches
+    /// Categories --delete-safe must leave alone, e.g. --except app-web-caches
     #[arg(long, value_delimiter = ',', value_name = "CAT")]
     except: Vec<String>,
 

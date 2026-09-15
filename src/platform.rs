@@ -377,7 +377,13 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     }
 
     push_unclaimed(&mut out, instruments_traces());
-    push_unclaimed(&mut out, app_web_caches(std::slice::from_ref(&support)));
+    push_unclaimed(
+        &mut out,
+        with_browsers_held_back(
+            app_web_caches(std::slice::from_ref(&support)),
+            std::slice::from_ref(&support),
+        ),
+    );
     push_unclaimed(&mut out, container_caches(home));
 
     if let Ok(out_bytes) = std::process::Command::new("brew").arg("--cache").output()
@@ -395,23 +401,55 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
 
     // One entry per app rather than the whole directory, so the report names
     // what is actually large instead of reporting one opaque total.
-    if let Ok(entries) = std::fs::read_dir(home.join("Library/Caches")) {
-        let per_app = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .map(|path| {
-                let category = path
-                    .file_name()
-                    .and_then(|name| held_back_cache(&name.to_string_lossy()))
-                    .unwrap_or(Category::MacOsCaches);
-                (path, category)
-            })
-            .collect();
-        push_unclaimed(&mut out, per_app);
-    }
+    push_unclaimed(&mut out, library_caches(&home.join("Library/Caches")));
 
     out
+}
+
+#[cfg(not(windows))]
+fn library_caches(caches: &Path) -> Vec<(PathBuf, Category)> {
+    let Ok(entries) = std::fs::read_dir(caches) else {
+        return Vec::new();
+    };
+    let roots = [caches.to_path_buf()];
+    let mut out = Vec::new();
+
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if !path.is_dir() {
+            continue;
+        }
+        // Google keeps Chrome beside Android Studio in one folder. Taken whole,
+        // the folder would be the outermost target and carry Chrome with it.
+        let apps = if holds_a_browser(&path, &roots) {
+            subdirectories(&path)
+        } else {
+            vec![path]
+        };
+        for app in apps {
+            let category = if is_browser_path(&app, &roots) {
+                Category::BrowserCache
+            } else {
+                app.file_name()
+                    .and_then(|name| held_back_cache(&name.to_string_lossy()))
+                    .unwrap_or(Category::MacOsCaches)
+            };
+            out.push((app, category));
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Directories under ~/Library/Caches that the name alone gets wrong. The sweep
@@ -505,6 +543,75 @@ fn instruments_traces() -> Vec<(PathBuf, Category)> {
     }
 
     out
+}
+
+/// Where browsers keep their caches, relative to a per-app data root: Application
+/// Support, Library/Caches or Library/Containers on macOS, %APPDATA% or
+/// %LOCALAPPDATA% on Windows. They hold nothing personal, but are kept out of
+/// automatic deletion on request and reported instead.
+const BROWSER_DIRS: &[&str] = &[
+    "Google/Chrome",
+    "Google/Chrome Beta",
+    "Google/Chrome Canary",
+    "Google/Chrome Dev",
+    "com.google.Chrome",
+    "Microsoft Edge",
+    "Microsoft/Edge",
+    "com.microsoft.edgemac",
+    "BraveSoftware",
+    "com.brave.Browser",
+    "Arc",
+    "company.thebrowser.Browser",
+    "Vivaldi",
+    "com.vivaldi.Vivaldi",
+    "Chromium",
+    "org.chromium.Chromium",
+    "Opera Software",
+    "com.operasoftware.Opera",
+    "com.operasoftware.OperaGX",
+    "Firefox",
+    "Mozilla",
+    "org.mozilla.firefox",
+    "com.apple.Safari",
+    "com.apple.Safari.SafeBrowsing",
+    "com.apple.Safari.WebApp",
+];
+
+fn browser_dirs(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    BROWSER_DIRS.iter().map(move |dir| {
+        dir.split('/')
+            .fold(root.to_path_buf(), |path, part| path.join(part))
+    })
+}
+
+fn is_browser_path(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| browser_dirs(root).any(|browser| path.starts_with(browser)))
+}
+
+/// True for a folder that is not itself a browser but has one inside it.
+#[cfg(not(windows))]
+fn holds_a_browser(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| browser_dirs(root).any(|browser| browser != path && browser.starts_with(path)))
+}
+
+fn with_browsers_held_back(
+    found: Vec<(PathBuf, Category)>,
+    roots: &[PathBuf],
+) -> Vec<(PathBuf, Category)> {
+    found
+        .into_iter()
+        .map(|(path, category)| {
+            if is_browser_path(&path, roots) {
+                (path, Category::BrowserCache)
+            } else {
+                (path, category)
+            }
+        })
+        .collect()
 }
 
 /// The directory names Chromium uses for its caches, identical under every
@@ -637,6 +744,8 @@ fn container_caches_in(containers: &Path, providers: &[String]) -> Vec<(PathBuf,
         .filter_map(|entry| {
             let category = if is_sync_container(&entry.file_name().to_string_lossy(), providers) {
                 Category::CloudMirror
+            } else if is_browser_path(&entry.path(), &[containers.to_path_buf()]) {
+                Category::BrowserCache
             } else {
                 Category::ContainerCaches
             };
@@ -883,7 +992,11 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     // Every Electron app keeps a Chromium cache tree under one of these two,
     // and none of them is a browser the named sweep above knows about. Runs
     // last so a path an earlier rule claimed keeps its category.
-    push_unclaimed(&mut out, app_web_caches(&[roaming, local]));
+    let roots = [roaming, local];
+    push_unclaimed(
+        &mut out,
+        with_browsers_held_back(app_web_caches(&roots), &roots),
+    );
 
     out
 }
@@ -1173,6 +1286,102 @@ mod target_tests {
         assert!(
             skip.iter().any(|root| bytecode.starts_with(root)),
             "{skip:?}"
+        );
+    }
+
+    // Holding browsers back by name alone would miss Chrome: ~/Library/Caches
+    // keeps it inside Google beside Android Studio, and the Google folder taken
+    // whole is the outermost target, which deletes Chrome with it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_browser_inside_a_vendor_folder_is_split_out_and_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let caches = dir.path();
+        for app in [
+            "Google/Chrome",
+            "Google/AndroidStudio2026.1",
+            "Firefox",
+            "com.spotify.client",
+            "org.swift.swiftpm",
+        ] {
+            std::fs::create_dir_all(caches.join(app)).unwrap();
+        }
+
+        let found = library_caches(caches);
+        let category = |app: &str| {
+            found
+                .iter()
+                .find(|(path, _)| *path == caches.join(app))
+                .map(|(_, category)| *category)
+        };
+
+        assert_eq!(
+            category("Google"),
+            None,
+            "the vendor folder itself is not a target"
+        );
+        assert_eq!(category("Google/Chrome"), Some(Category::BrowserCache));
+        assert_eq!(
+            category("Google/AndroidStudio2026.1"),
+            Some(Category::MacOsCaches)
+        );
+        assert_eq!(category("Firefox"), Some(Category::BrowserCache));
+        assert_eq!(
+            category("com.spotify.client"),
+            Some(Category::ExpensiveCache)
+        );
+        assert_eq!(category("org.swift.swiftpm"), Some(Category::MacOsCaches));
+    }
+
+    #[test]
+    fn a_browsers_chromium_caches_are_held_back_but_an_apps_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let chrome = root.join("Google/Chrome/Default/GPUCache");
+        let edge = root.join("Microsoft/Edge/User Data/ShaderCache");
+        let teams = root.join("Microsoft/Teams/Cache");
+        for path in [&chrome, &edge, &teams] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        let found = with_browsers_held_back(
+            app_web_caches(std::slice::from_ref(&root)),
+            std::slice::from_ref(&root),
+        );
+        let category = |path: &PathBuf| {
+            found
+                .iter()
+                .find(|(found, _)| found == path)
+                .map(|(_, category)| *category)
+        };
+
+        assert_eq!(category(&chrome), Some(Category::BrowserCache));
+        assert_eq!(category(&edge), Some(Category::BrowserCache));
+        assert_eq!(category(&teams), Some(Category::AppWebCache));
+    }
+
+    // Safari keeps most of its cache inside its sandbox, not in Library/Caches.
+    #[cfg(not(windows))]
+    #[test]
+    fn safaris_container_cache_is_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let containers = dir.path();
+        for id in ["com.apple.Safari", "com.tinyspeck.slackmacgap"] {
+            std::fs::create_dir_all(containers.join(id).join("Data/Library/Caches")).unwrap();
+        }
+
+        let found = container_caches_in(containers, &[]);
+        let category = |id: &str| {
+            found
+                .iter()
+                .find(|(path, _)| path.starts_with(containers.join(id)))
+                .map(|(_, category)| *category)
+        };
+
+        assert_eq!(category("com.apple.Safari"), Some(Category::BrowserCache));
+        assert_eq!(
+            category("com.tinyspeck.slackmacgap"),
+            Some(Category::ContainerCaches)
         );
     }
 

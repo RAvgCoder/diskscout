@@ -42,6 +42,7 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
         "APP DATA & CACHES",
         &[
             Category::AppWebCache,
+            Category::BrowserCache,
             Category::ContainerCaches,
             Category::ExpensiveCache,
             Category::CloudMirror,
@@ -58,7 +59,6 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
             Category::WindowsCaches,
             Category::ThumbnailCache,
             Category::InstallerCache,
-            Category::BrowserCache,
         ],
     ),
     (

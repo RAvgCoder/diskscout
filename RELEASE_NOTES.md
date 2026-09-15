@@ -1,9 +1,26 @@
-## v0.1.0
+## v0.2.0
 
-diskscout is a command-line tool that finds reclaimable disk space on developer machines and deletes it safely, on macOS and Windows alike. It walks the filesystem looking for build artifacts, package manager caches, and other regenerable data — Gradle, Cargo, Maven, Go, NuGet, yarn/pnpm, browser caches, IDE indexes, and dozens more — and reports what's taking up space, broken down by category rather than as one opaque total.
+**Adds a standalone Apple-silicon packaging script, moves browser caches to review-only on both platforms, and fixes false-positive deletions of nvm's npm and Service Worker data.**
 
-The core of the project is knowing what *not* to touch. Cloud sync state for Google Drive, OneDrive, iCloud, and Dropbox is identified and left alone rather than treated as an ordinary cache, since clearing it can force multi-hundred-gigabyte re-downloads or strand offline-only files. Installed software is protected too: Homebrew and other package manager prefixes, `.app` bundles, and tool install directories (bun, npm globals) are recognized as shipped code rather than build output, even when their contents look identical to a disposable `node_modules` tree. A separate "review-carefully" category holds back caches that are technically regenerable but expensive to rebuild — photo and media analysis, Siri voices, offline map tiles — so they're reported but never deleted without being asked for by name.
+### Breaking
 
-Sizing is done carefully as well: sparse files, hard links, OneDrive placeholders, and nested build targets are all accounted for so the space a scan promises is the space a delete can actually return. Deletion itself is driven by `--delete-safe`, with `--except` to exclude specific categories and `-y` to skip the confirmation prompt, and live OS directories are emptied in place rather than removed outright.
+- **Browser caches no longer auto-deleted; macOS now scans them too**: `BrowserCache` was Windows-only and classified as safe to auto-delete. It's now `review-carefully` on both platforms, and Chrome, Edge, Firefox, Safari, and Opera caches are all detected and excluded from automatic deletion.
+  - Before: `--delete-safe` removed `BrowserCache` (Windows only)
+  - After: browser caches are reported but require manual review, on macOS and Windows alike
+- **Installed binary moved from `~/.local/bin` to `/usr/local/bin`**: `install.sh` no longer writes to `.zshrc`, since `/etc/paths` already puts `/usr/local/bin` on every Mac's `PATH`. Avoids the ~27ms shell-startup cost the old completion setup added.
+  - Before: installed to `~/.local/bin`, appended PATH and a `compinit` completion block to `.zshrc`
+  - After: installs to `/usr/local/bin`, no dotfiles touched, may prompt for `sudo` on directories that aren't already writable
 
-This first tagged release brings the tool to feature parity across both major desktop platforms, backed by a CI gate, dependency audit, and an initial test suite, with a README documenting how the safety model works and where the macOS and Windows behavior diverges.
+### Added
+
+- **Standalone Apple silicon package (`scripts/package-macos.sh`)**: builds an arm64-only, ad-hoc-signed binary bundle with an installer and README for a Mac that has neither the repo nor a Rust toolchain.
+  - Pinned to the M1 CPU baseline and macOS 11.0 minimum, and remaps build-machine paths out of the binary.
+  - Refuses to package a binary that isn't arm64-only, needs a newer macOS, or links a library from outside the OS (e.g. a Homebrew dylib).
+  - `install.sh` clears the AirDrop quarantine flag after a checksum check, needs no password, and runs on the system bash 3.2.
+
+### Fixed
+
+- **Chrome and Opera caches escaped browser-cache protections**: Chrome's cache sits inside the shared `~/Library/Caches/Google` vendor folder next to Android Studio, so deleting "Google" as one target would have taken Chrome with it; that folder is now split per-app so Android Studio's cache is still removed but Chrome's is kept. Opera on Windows lives under `%APPDATA%`, outside the named browser sweep, and is now caught by the Electron sweep instead.
+- **`nvm`'s npm and corepack no longer offered for deletion**: `~/.nvm/versions/node/vX/lib/node_modules` (npm and corepack) was flagged as deletable build output. Runtime version manager roots — nvm, fnm, Volta, nodenv, asdf, rbenv, mise, and pyenv — are now excluded from the walk entirely.
+- **Service Worker registrations preserved during cache cleanup**: only the `CacheStorage` subdirectory is deleted now; the sibling `Database` directory, which holds push-notification and offline-app registrations, was previously swept along with it on macOS. Brings macOS in line with existing Windows behavior.
+- **Four macOS-only safety guards added on Windows**: Scoop installs, home-directory conda, `%LOCALAPPDATA%\Programs`, and OneDrive sync roots (matching the existing `~/Library/CloudStorage` guard) are now excluded from deletion the same way their macOS counterparts already were.

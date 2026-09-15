@@ -29,6 +29,23 @@ later runs skip source discovery.
 Requires Rust 1.95 or newer (edition 2024). The only dependencies are `walkdir`, `rayon`,
 `clap`, `colored` and `indicatif`.
 
+## Handing it to someone without the source
+
+    scripts/package-macos.sh     # -> dist/diskscout-<version>-macos-arm64.zip
+
+Builds a standalone Apple silicon binary and zips it with an installer and a plain-text
+README, for a Mac that has neither this repo nor a Rust toolchain. Unzip, then
+`bash install.sh`. It installs to `~/.local/bin` without a password, adds that to `PATH`,
+sets up tab completion, and refuses a copy whose checksum does not match.
+
+The binary targets the M1 instruction set and macOS 11.0, the oldest macOS any Apple
+silicon Mac shipped with, so it runs on every one of them regardless of which chip built
+it. It links nothing outside macOS itself. It carries an ad-hoc signature, which Apple
+silicon requires before it will run anything, but it is not notarized, so the installer
+clears the quarantine flag AirDrop and browsers attach. That is the scripted equivalent
+of "Open Anyway"; distributing beyond people who trust the sender deserves a Developer ID
+signature and notarization instead.
+
 ## Use
 
     diskscout                          # scan $HOME, report, delete nothing

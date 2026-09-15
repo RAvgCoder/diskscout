@@ -181,26 +181,48 @@ fn installed_software_roots(home: &Path) -> Vec<PathBuf> {
         // here backs every binary in ~/.bun/bin, while its sibling
         // install/cache is a real cache and stays deletable.
         home.join(".bun").join("install").join("global"),
+        // Runtime version managers install whole toolchains here. An nvm Node
+        // version's lib/node_modules is npm and corepack themselves, and a
+        // pyenv Python's __pycache__ belongs to its standard library.
+        home.join(".pyenv"),
     ];
+    // A conda prefix's __pycache__ belongs to the interpreter it shipped. The
+    // per-user install lands in the home directory on every platform.
+    for prefix in ["miniconda3", "anaconda3", "miniforge3", "mambaforge"] {
+        roots.push(home.join(prefix));
+    }
     #[cfg(windows)]
     {
         // npm's global prefix: node_modules here *is* the installed tool set.
         roots.push(roaming_app_data(home).join("npm"));
+        roots.push(roaming_app_data(home).join("nvm"));
+        roots.push(roaming_app_data(home).join("fnm"));
+        roots.push(local_app_data(home).join("Volta"));
+        roots.push(local_app_data(home).join("mise"));
+        // Scoop is Windows' Homebrew: every app under it is an install, so its
+        // node_modules and __pycache__ are the software, not build output.
+        roots.push(home.join("scoop"));
+        // Per-user installs, the Windows counterpart of an .app bundle: the
+        // python.org interpreter keeps its standard library bytecode here.
+        roots.push(local_app_data(home).join("Programs"));
     }
     #[cfg(not(windows))]
     {
         roots.push(home.join(".npm-global"));
-        // A package manager's prefix is installed software all the way down.
-        // The node_modules under a Homebrew formula is the CLI that formula
-        // installed, and the __pycache__ under a conda prefix belongs to the
-        // interpreter it shipped. Homebrew uses the first path on Apple
-        // silicon and the second on Intel.
+        for manager in [".nvm", ".volta", ".fnm", ".nodenv", ".asdf", ".rbenv"] {
+            roots.push(home.join(manager));
+        }
+        roots.push(home.join(".local").join("share").join("fnm"));
+        roots.push(home.join(".local").join("share").join("mise"));
+        // A package manager's prefix is installed software all the way down:
+        // the node_modules under a Homebrew formula is the CLI that formula
+        // installed. Homebrew uses the first path on Apple silicon and the
+        // second on Intel.
         roots.push(PathBuf::from("/opt/homebrew"));
         roots.push(PathBuf::from("/usr/local"));
         roots.push(PathBuf::from("/opt/local"));
         for prefix in ["miniconda3", "anaconda3", "miniforge3", "mambaforge"] {
             roots.push(PathBuf::from("/opt").join(prefix));
-            roots.push(home.join(prefix));
         }
     }
     roots
@@ -501,7 +523,6 @@ const WEB_CACHE_DIRS: &[&str] = &[
     "GPUCache",
     "GrShaderCache",
     "ShaderCache",
-    "Service Worker",
     "component_crx_cache",
 ];
 
@@ -533,7 +554,14 @@ fn collect_web_caches(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, Category)>
         if NEVER_SWEEP.iter().any(|tree| name == **tree) {
             continue;
         }
-        if WEB_CACHE_DIRS.iter().any(|cache| name == **cache) {
+        if name == "Service Worker" {
+            // Only its CacheStorage is a cache. The Database beside it holds the
+            // service worker registrations that web push and offline apps need.
+            let storage = entry.path().join("CacheStorage");
+            if storage.is_dir() {
+                out.push((storage, Category::AppWebCache));
+            }
+        } else if WEB_CACHE_DIRS.iter().any(|cache| name == **cache) {
             out.push((entry.path(), Category::AppWebCache));
         } else if depth > 0 {
             collect_web_caches(&entry.path(), depth - 1, out);
@@ -693,6 +721,14 @@ pub fn skip_paths(home: &Path) -> Vec<PathBuf> {
         // it, and Store apps keep real downloaded content in it.
         local.join("Packages"),
     ];
+    // OneDrive's sync roots, the counterpart of ~/Library/CloudStorage: a
+    // deletion inside one propagates to the cloud copy, and Windows exports
+    // each root it has registered.
+    for var in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        if let Some(root) = env_path(var) {
+            skip.push(root);
+        }
+    }
     skip.extend(installed_software_roots(home));
     skip
 }
@@ -1043,7 +1079,7 @@ mod target_tests {
         // The three shapes seen in the wild: an app, a session partition, and
         // a browser profile.
         let plain = support.join("Discord/Cache");
-        let partition = support.join("Notion/Partitions/notion/Service Worker");
+        let partition = support.join("Notion/Partitions/notion/Service Worker/CacheStorage");
         let profile = support.join("Google/Chrome/Default/Code Cache");
         for path in [&plain, &partition, &profile] {
             std::fs::create_dir_all(path).unwrap();
@@ -1062,6 +1098,81 @@ mod target_tests {
         assert!(
             !found.contains(&plain.join("Cache")),
             "a nested match would be counted twice: {found:?}"
+        );
+    }
+
+    // Web push and offline apps depend on the registrations in Database, so
+    // only the CacheStorage beside it may go.
+    #[test]
+    fn a_service_workers_registrations_survive_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("Google/Chrome/Default/Service Worker");
+        for child in ["CacheStorage", "Database", "ScriptCache"] {
+            std::fs::create_dir_all(worker.join(child)).unwrap();
+        }
+
+        let found: Vec<PathBuf> = app_web_caches(&[dir.path().to_path_buf()])
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+
+        assert_eq!(found, vec![worker.join("CacheStorage")]);
+    }
+
+    // A second Mac's scan offered nvm's lib/node_modules for deletion, which is
+    // npm and corepack for that Node version.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_version_managers_toolchains_are_never_walked() {
+        let home = Path::new("/Users/x");
+        let skip = skip_paths(home);
+        let npm = home.join(".nvm/versions/node/v20.19.0/lib/node_modules");
+
+        assert!(skip.iter().any(|root| npm.starts_with(root)), "{skip:?}");
+        assert!(skip.iter().any(|root| {
+            home.join(".pyenv/versions/3.12.0/lib/python3.12/__pycache__")
+                .starts_with(root)
+        }));
+        assert!(
+            !skip
+                .iter()
+                .any(|root| home.join("Developer/app/node_modules").starts_with(root))
+        );
+    }
+
+    // The macOS guards for version managers, package manager prefixes, installed
+    // apps and cloud mounts, as the same failures take shape on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_installed_toolchains_are_never_walked_on_windows() {
+        let home = Path::new(r"C:\Users\x");
+        let skip = skip_paths(home);
+        let walked = |path: PathBuf| !skip.iter().any(|root| path.starts_with(root));
+
+        let roaming = roaming_app_data(home);
+        let local = local_app_data(home);
+        assert!(!walked(roaming.join(r"nvm\v20.19.0\node_modules")));
+        assert!(!walked(
+            home.join(r"scoop\apps\nodejs\current\node_modules")
+        ));
+        assert!(!walked(
+            local.join(r"Programs\Python\Python312\Lib\__pycache__")
+        ));
+        assert!(!walked(home.join(r"miniconda3\Lib\__pycache__")));
+        assert!(!walked(local.join(r"Volta\tools\image\node")));
+
+        assert!(walked(home.join(r"source\repos\app\node_modules")));
+    }
+
+    #[test]
+    fn a_home_conda_install_is_never_walked() {
+        let home = Path::new("/Users/x");
+        let skip = skip_paths(home);
+        let bytecode = home.join("miniconda3/lib/python3.13/__pycache__");
+
+        assert!(
+            skip.iter().any(|root| bytecode.starts_with(root)),
+            "{skip:?}"
         );
     }
 

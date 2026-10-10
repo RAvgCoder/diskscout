@@ -20,8 +20,12 @@ actually give back. Most of this codebase is about those two things.
 
 The hidden `__bootstrap` subcommand runs `cargo install --path . --force`, writes shell
 completions for your shell (zsh, bash or fish detected from `$SHELL`, PowerShell on
-Windows), patches the rc file or `$PROFILE` to load them, and records `DISKSCOUT_SRC` so
-later runs skip source discovery.
+Windows), makes the shell load them, and records `DISKSCOUT_SRC` so later runs skip
+source discovery. On zsh it runs your startup files in a fresh `zsh -i` first and edits
+them only if `~/.zsh/completions` does not already load: the `fpath` line goes into
+`~/.zshenv`, and a `compinit` is added to `.zshrc` only when nothing runs one, so
+installing never adds a second `compinit`. If zsh cannot be run, nothing is edited and
+the line to add is printed.
 
     __bootstrap --only-completions    # refresh completions without rebuilding
     __bootstrap --debug               # debug profile, faster link

@@ -121,11 +121,11 @@ pub fn print_report(result: &ScanResult, home: &Path) {
                 continue;
             }
             let cat_total: u64 = dirs.iter().map(|d| d.size).sum();
-            let safe_label = if cat.safe_to_delete() {
-                " (safe to delete)".dimmed().to_string()
-            } else {
-                String::new()
-            };
+            let safe_label = cat
+                .sweep()
+                .tag()
+                .map(|tag| format!(" ({tag})").dimmed().to_string())
+                .unwrap_or_default();
 
             println!(
                 "    {:<28} {}{}",

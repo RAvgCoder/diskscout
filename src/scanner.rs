@@ -155,7 +155,6 @@ impl Category {
                 | Category::NpmCache
                 | Category::YarnPnpmCache
                 | Category::HomebrewCache
-                | Category::UvCache
                 | Category::PipCache
                 | Category::NugetCache
                 | Category::CargoRegistry
@@ -1073,7 +1072,6 @@ mod tests {
     fn only_regenerable_categories_are_marked_safe() {
         assert!(Category::RustTarget.safe_to_delete());
         assert!(Category::NodeModules.safe_to_delete());
-        assert!(Category::UvCache.safe_to_delete());
         assert!(Category::WindowsTemp.safe_to_delete());
         assert!(Category::RecycleBin.safe_to_delete());
         assert!(!Category::IphoneBackups.safe_to_delete());
@@ -1090,6 +1088,9 @@ mod tests {
         assert!(!Category::AndroidEmulator.safe_to_delete());
         // Nothing personal lives in them, but they are held back on request.
         assert!(!Category::BrowserCache.safe_to_delete());
+        // Every uvx run and new virtualenv installs out of it, so clearing it
+        // means re-downloading on the next one.
+        assert!(!Category::UvCache.safe_to_delete());
     }
 
     // Removing any of it breaks the bundle's code signature, and an IDE ships

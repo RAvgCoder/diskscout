@@ -159,15 +159,14 @@ cache directories rather than the top eight.
 
 Deletion is permanent. Not the Trash, no undo.
 
-Thirty-one of the forty-eight categories are tagged **safe to delete**: regenerable on
+Thirty of the forty-eight categories are tagged **safe to delete**: regenerable on
 demand, costing a rebuild or a re-download but never data. `--delete-safe` takes exactly
 these.
 
-The other seventeen are tagged **review carefully** and `--delete-safe` never touches them,
+The other eighteen are tagged **review carefully** and `--delete-safe` never touches them,
 whatever `--except` says. Virtualenvs, framework build directories, DerivedData, simulators
-and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
-hours to rebuild,
-`Windows.old`, the installer payload cache still needed to repair or uninstall, Docker and
+and their runtimes, iPhone backups, browser caches, the uv cache, the cloud mirror, the
+caches that cost hours to rebuild, `Windows.old`, the installer payload cache still needed to repair or uninstall, Docker and
 WSL data, the Android SDK and emulator images. They are still measured and still reported,
 because knowing where the space went is useful even when removing it is your call.
 
@@ -231,9 +230,10 @@ and per-user installs under `%LOCALAPPDATA%\Programs` on Windows.
 **Caches that cost more than a download.** Photo and media analysis run over the whole
 library, so clearing them buys a few hundred megabytes and spends hours of CPU re-deriving
 what was already there. Siri's downloaded voices, offline map tiles, Spotify's offline
-playlists and Office's co-authoring state are the same trade in bandwidth. Reported, never
-swept. An IDE index is deliberately not in that set: rebuilding it is exactly the trade the
-sweep exists to make.
+playlists and Office's co-authoring state are the same trade in bandwidth, and so is the uv
+cache, which every `uvx` run and new virtualenv installs out of. Reported, never swept. An
+IDE index is deliberately not in that set: rebuilding it is exactly the trade the sweep
+exists to make.
 
 `~/Library/Caches` is regenerable by definition and the sweep takes all of it, so the few
 entries where that is untrue are named individually rather than assumed.

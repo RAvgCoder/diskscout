@@ -49,7 +49,7 @@ struct ScanArgs {
     #[arg(long)]
     delete_targets: bool,
 
-    /// Delete every category marked regenerable, skipping the rest
+    /// Delete every regenerable category and prune the uv cache, one prompt
     #[arg(long)]
     delete_safe: bool,
 

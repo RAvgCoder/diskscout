@@ -15,6 +15,43 @@ struct FileLimits {
     old_min: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    Clean(Clean),
+    Review,
+}
+
+impl Sweep {
+    /// The report's note beside the category; review-carefully ones carry none.
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Sweep::Clean(Clean::Remove) => Some("safe to delete"),
+            Sweep::Clean(Clean::Prune(_)) => Some("pruned by --delete-safe"),
+            Sweep::Review => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clean {
+    Remove,
+    /// Only entries nothing references go, through the owning tool.
+    Prune(Pruner),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pruner {
+    Uv,
+}
+
+impl Pruner {
+    pub fn command(self) -> &'static str {
+        match self {
+            Pruner::Uv => "uv cache prune",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Category {
     // Build artifacts, found by pattern during the walk.
@@ -127,42 +164,59 @@ impl Category {
         }
     }
 
-    /// Regenerable on demand: deleting costs a re-download or a rebuild, never
-    /// data. Everything else is reported but flagged for review.
-    pub fn safe_to_delete(self) -> bool {
-        matches!(
-            self,
+    /// What --delete-safe does with this category. Removal costs a re-download
+    /// or a rebuild, never data.
+    pub fn sweep(self) -> Sweep {
+        match self {
             Category::RustTarget
-                | Category::NodeModules
-                | Category::PythonBytecode
-                | Category::SwiftPmBuild
-                | Category::DotNetBuild
-                | Category::VisualStudioCache
-                | Category::GradleBuild
-                | Category::XcTestDevices
-                | Category::MacOsCaches
-                | Category::XcodeDeviceSupport
-                | Category::XcodeCaches
-                | Category::InstrumentsTraces
-                | Category::AppWebCache
-                | Category::ContainerCaches
-                | Category::WindowsTemp
-                | Category::WindowsUpdate
-                | Category::RecycleBin
-                | Category::CrashDumps
-                | Category::WindowsCaches
-                | Category::ThumbnailCache
-                | Category::NpmCache
-                | Category::YarnPnpmCache
-                | Category::HomebrewCache
-                | Category::PipCache
-                | Category::NugetCache
-                | Category::CargoRegistry
-                | Category::GradleCache
-                | Category::MavenCache
-                | Category::GoModCache
-                | Category::IdeCache
-        )
+            | Category::NodeModules
+            | Category::PythonBytecode
+            | Category::SwiftPmBuild
+            | Category::DotNetBuild
+            | Category::VisualStudioCache
+            | Category::GradleBuild
+            | Category::XcTestDevices
+            | Category::MacOsCaches
+            | Category::XcodeDeviceSupport
+            | Category::XcodeCaches
+            | Category::InstrumentsTraces
+            | Category::AppWebCache
+            | Category::ContainerCaches
+            | Category::WindowsTemp
+            | Category::WindowsUpdate
+            | Category::RecycleBin
+            | Category::CrashDumps
+            | Category::WindowsCaches
+            | Category::ThumbnailCache
+            | Category::NpmCache
+            | Category::YarnPnpmCache
+            | Category::HomebrewCache
+            | Category::PipCache
+            | Category::NugetCache
+            | Category::CargoRegistry
+            | Category::GradleCache
+            | Category::MavenCache
+            | Category::GoModCache
+            | Category::IdeCache => Sweep::Clean(Clean::Remove),
+            Category::UvCache => Sweep::Clean(Clean::Prune(Pruner::Uv)),
+            Category::PythonEnv
+            | Category::NextJs
+            | Category::Nuxt
+            | Category::SvelteKit
+            | Category::CocoaPods
+            | Category::XcodeDerivedData
+            | Category::IosSimulators
+            | Category::SimulatorRuntimes
+            | Category::IphoneBackups
+            | Category::BrowserCache
+            | Category::ExpensiveCache
+            | Category::CloudMirror
+            | Category::WindowsOld
+            | Category::InstallerCache
+            | Category::DockerData
+            | Category::AndroidSdk
+            | Category::AndroidEmulator => Sweep::Review,
+        }
     }
 
     /// CLI-facing name, derived from the label so the two cannot drift apart.
@@ -1070,27 +1124,30 @@ mod tests {
 
     #[test]
     fn only_regenerable_categories_are_marked_safe() {
-        assert!(Category::RustTarget.safe_to_delete());
-        assert!(Category::NodeModules.safe_to_delete());
-        assert!(Category::WindowsTemp.safe_to_delete());
-        assert!(Category::RecycleBin.safe_to_delete());
-        assert!(!Category::IphoneBackups.safe_to_delete());
-        assert!(!Category::IosSimulators.safe_to_delete());
-        assert!(!Category::PythonEnv.safe_to_delete());
+        assert_eq!(Category::RustTarget.sweep(), Sweep::Clean(Clean::Remove));
+        assert_eq!(Category::NodeModules.sweep(), Sweep::Clean(Clean::Remove));
+        assert_eq!(Category::WindowsTemp.sweep(), Sweep::Clean(Clean::Remove));
+        assert_eq!(Category::RecycleBin.sweep(), Sweep::Clean(Clean::Remove));
+        assert_eq!(Category::IphoneBackups.sweep(), Sweep::Review);
+        assert_eq!(Category::IosSimulators.sweep(), Sweep::Review);
+        assert_eq!(Category::PythonEnv.sweep(), Sweep::Review);
         // Deleting these breaks repair/uninstall or throws away real state.
-        assert!(!Category::WindowsOld.safe_to_delete());
-        assert!(!Category::InstallerCache.safe_to_delete());
-        assert!(!Category::DockerData.safe_to_delete());
+        assert_eq!(Category::WindowsOld.sweep(), Sweep::Review);
+        assert_eq!(Category::InstallerCache.sweep(), Sweep::Review);
+        assert_eq!(Category::DockerData.sweep(), Sweep::Review);
         // Reported so the space is visible, never auto-deleted: one is real
         // data behind a placeholder, the other needs root and a re-download.
-        assert!(!Category::CloudMirror.safe_to_delete());
-        assert!(!Category::SimulatorRuntimes.safe_to_delete());
-        assert!(!Category::AndroidEmulator.safe_to_delete());
+        assert_eq!(Category::CloudMirror.sweep(), Sweep::Review);
+        assert_eq!(Category::SimulatorRuntimes.sweep(), Sweep::Review);
+        assert_eq!(Category::AndroidEmulator.sweep(), Sweep::Review);
         // Nothing personal lives in them, but they are held back on request.
-        assert!(!Category::BrowserCache.safe_to_delete());
+        assert_eq!(Category::BrowserCache.sweep(), Sweep::Review);
         // Every uvx run and new virtualenv installs out of it, so clearing it
         // means re-downloading on the next one.
-        assert!(!Category::UvCache.safe_to_delete());
+        assert_eq!(
+            Category::UvCache.sweep(),
+            Sweep::Clean(Clean::Prune(Pruner::Uv))
+        );
     }
 
     // Removing any of it breaks the bundle's code signature, and an IDE ships

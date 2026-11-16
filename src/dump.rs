@@ -29,11 +29,11 @@ pub fn write_full_report(result: &ScanResult, home: &Path, path: &Path) -> io::R
                 continue;
             }
             let cat_total: u64 = dirs.iter().map(|d| d.size).sum();
-            let safe_label = if cat.safe_to_delete() {
-                "  (safe to delete)"
-            } else {
-                ""
-            };
+            let safe_label = cat
+                .sweep()
+                .tag()
+                .map(|tag| format!("  ({tag})"))
+                .unwrap_or_default();
             s.push('\n');
             let _ = writeln!(
                 s,

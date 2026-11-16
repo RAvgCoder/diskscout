@@ -1184,6 +1184,7 @@ mod size_tests {
 #[cfg(test)]
 mod target_tests {
     use super::*;
+    use crate::scanner::Sweep;
 
     #[test]
     fn a_web_cache_is_found_at_every_depth_and_never_descended_into() {
@@ -1460,7 +1461,7 @@ mod target_tests {
 
     #[test]
     fn the_protected_caches_are_never_auto_deleted() {
-        assert!(!Category::ExpensiveCache.safe_to_delete());
+        assert_eq!(Category::ExpensiveCache.sweep(), Sweep::Review);
         assert!(Category::ExpensiveCache.delete_contents_only());
     }
 
@@ -1489,7 +1490,7 @@ mod target_tests {
 
     #[test]
     fn a_sync_container_is_never_offered_for_deletion() {
-        assert!(!Category::CloudMirror.safe_to_delete());
+        assert_eq!(Category::CloudMirror.sweep(), Sweep::Review);
     }
 
     // ~/Library/Caches is regenerable by definition, which is why the sweep

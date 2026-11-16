@@ -2,9 +2,15 @@ use colored::Colorize;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use crate::report::all_categories;
-use crate::scanner::{Category, FoundDir, ScanResult, dir_stats, display_path, fmt_size};
+use crate::scanner::{
+    Category, Clean, FoundDir, Pruner, ScanResult, Sweep, dir_stats, display_path, fmt_size,
+};
+
+/// How long a pruner may wait on a cache another process holds before giving up.
+const PRUNE_LOCK_TIMEOUT_SECS: &str = "10";
 
 pub fn delete_category(result: &ScanResult, category: Category, home: &Path) {
     let targets = result.dirs_by_category(category);
@@ -43,16 +49,20 @@ pub fn delete_category(result: &ScanResult, category: Category, home: &Path) {
     println!("\n  {} freed.", fmt_size(freed).bold().green());
 }
 
-/// Deletes every category marked regenerable, leaving the review-carefully
-/// ones untouched. One confirmation covers the whole set.
+/// Cleans every category not held for review: removed outright, or pruned by
+/// the tool that owns it. One confirmation covers the whole set.
 pub fn delete_safe(
     result: &ScanResult,
     home: &Path,
     assume_yes: bool,
     except: &[String],
 ) -> Result<(), String> {
-    let candidates: Vec<Category> = all_categories()
-        .filter(|c| c.safe_to_delete() && !result.dirs_by_category(*c).is_empty())
+    let candidates: Vec<(Category, Clean)> = all_categories()
+        .filter(|c| !result.dirs_by_category(*c).is_empty())
+        .filter_map(|c| match c.sweep() {
+            Sweep::Clean(clean) => Some((c, clean)),
+            Sweep::Review => None,
+        })
         .collect();
 
     // A name matching no category at all is a typo, and the caller believes it
@@ -61,7 +71,7 @@ pub fn delete_safe(
     // what a fixed --except set on a machine without that cache means.
     for name in except {
         if !all_categories().any(|c| &c.slug() == name) {
-            let valid: Vec<String> = candidates.iter().map(|c| c.slug()).collect();
+            let valid: Vec<String> = candidates.iter().map(|(c, _)| c.slug()).collect();
             return Err(format!(
                 "unknown category '{name}'.\n  Deletable categories in this scan: {}",
                 valid.join(", ")
@@ -69,9 +79,9 @@ pub fn delete_safe(
         }
     }
 
-    let cats: Vec<Category> = candidates
+    let cats: Vec<(Category, Clean)> = candidates
         .into_iter()
-        .filter(|c| !except.contains(&c.slug()))
+        .filter(|(c, _)| !except.contains(&c.slug()))
         .collect();
 
     if cats.is_empty() {
@@ -83,33 +93,54 @@ pub fn delete_safe(
         println!("  {} {name}", "excluded:".yellow());
     }
 
-    let total: u64 = cats.iter().map(|c| result.category_total(*c)).sum();
+    // A prune frees an unknown share of its cache, so only removals are summed.
+    let total: u64 = cats
+        .iter()
+        .map(|(c, clean)| match clean {
+            Clean::Remove => result.category_total(*c),
+            Clean::Prune(_) => 0,
+        })
+        .sum();
 
     println!();
-    println!("  {}", "About to delete these categories:".bold());
-    for cat in &cats {
+    println!("  {}", "About to clean these categories:".bold());
+    for (cat, clean) in &cats {
         let dirs = result.dirs_by_category(*cat);
+        let how = match clean {
+            Clean::Remove => format!(
+                "{} {}",
+                dirs.len(),
+                if dirs.len() == 1 { "dir" } else { "dirs" }
+            ),
+            Clean::Prune(pruner) => format!("{}, unused entries only", pruner.command()),
+        };
         println!(
-            "    {:<28} {:>9}  ({} {}, --except {})",
+            "    {:<28} {:>9}  ({how}, --except {})",
             cat.label().cyan(),
             fmt_size(result.category_total(*cat)),
-            dirs.len(),
-            if dirs.len() == 1 { "dir" } else { "dirs" },
             cat.slug().dimmed()
         );
     }
-    println!("    {:<28} {:>9}", "TOTAL".bold(), fmt_size(total).bold());
+    println!(
+        "    {:<28} {:>9}  {}",
+        "TOTAL".bold(),
+        fmt_size(total).bold(),
+        "(plus whatever the prunes free)".dimmed()
+    );
 
-    if !assume_yes && !confirm(&format!("\n  Delete all of it? [{}/N] ", "y".green())) {
+    if !assume_yes && !confirm(&format!("\n  Clean all of it? [{}/N] ", "y".green())) {
         println!("  Skipped.");
         return Ok(());
     }
 
     let mut total_freed = 0u64;
-    for cat in &cats {
+    for (cat, clean) in &cats {
         println!("\n  {}", cat.label().cyan().bold());
         for d in &result.dirs_by_category(*cat) {
-            total_freed += remove_reporting(d, home, "    ");
+            total_freed += match clean {
+                Clean::Remove => remove_reporting(d, home, "    "),
+                Clean::Prune(pruner) => prune_reporting(d, *pruner, home, "    "),
+            };
         }
     }
 
@@ -128,17 +159,18 @@ pub fn interactive_delete(result: &ScanResult, home: &Path) {
         }
 
         let cat_total: u64 = dirs.iter().map(|d| d.size).sum();
-        let safe = if cat.safe_to_delete() {
-            " [safe to delete]".green().to_string()
-        } else {
-            " [review carefully]".yellow().to_string()
+        let sweep = cat.sweep();
+        let badge = match sweep {
+            Sweep::Clean(Clean::Remove) => " [safe to delete]".green().to_string(),
+            Sweep::Clean(Clean::Prune(_)) => " [pruned by --delete-safe]".green().to_string(),
+            Sweep::Review => " [review carefully]".yellow().to_string(),
         };
 
         println!(
             "\n  {} -- {}{}",
             cat.label().cyan().bold(),
             fmt_size(cat_total).bold(),
-            safe
+            badge
         );
         for d in dirs.iter().take(5) {
             println!("    {}", display_path(&d.path, home).dimmed());
@@ -153,18 +185,101 @@ pub fn interactive_delete(result: &ScanResult, home: &Path) {
             );
         }
 
-        if !confirm("  Delete this category? [y/N] ") {
-            println!("  Skipped.");
-            continue;
-        }
+        let clean = match sweep {
+            Sweep::Clean(Clean::Prune(pruner)) => {
+                match ask("  Prune unused entries, delete all of it, or skip? [p/d/N] ").as_str() {
+                    "p" => Clean::Prune(pruner),
+                    "d" => Clean::Remove,
+                    _ => {
+                        println!("  Skipped.");
+                        continue;
+                    }
+                }
+            }
+            Sweep::Clean(Clean::Remove) | Sweep::Review => {
+                if !confirm("  Delete this category? [y/N] ") {
+                    println!("  Skipped.");
+                    continue;
+                }
+                Clean::Remove
+            }
+        };
 
         for d in &dirs {
-            total_freed += remove_reporting(d, home, "    ");
+            total_freed += match clean {
+                Clean::Remove => remove_reporting(d, home, "    "),
+                Clean::Prune(pruner) => prune_reporting(d, pruner, home, "    "),
+            };
         }
     }
 
     println!();
     println!("  Total freed: {}", fmt_size(total_freed).bold().green());
+}
+
+/// Prunes one cache through its owning tool, prints the outcome, and returns
+/// the bytes reclaimed.
+fn prune_reporting(dir: &FoundDir, pruner: Pruner, home: &Path, indent: &str) -> u64 {
+    let (freed, error) = prune(dir, pruner);
+    let shown = display_path(&dir.path, home);
+
+    match error {
+        None => println!(
+            "{indent}{} {} -- {} freed",
+            "pruned".red(),
+            shown.dimmed(),
+            fmt_size(freed)
+        ),
+        Some(e) => eprintln!("{indent}{} {}: {e}", "skipped".yellow(), shown),
+    }
+
+    freed
+}
+
+fn prune(dir: &FoundDir, pruner: Pruner) -> (u64, Option<String>) {
+    let mut command = match pruner {
+        // Without a lock timeout uv waits for as long as any other uv process
+        // holds the cache. --force is never passed: prune also removes cached
+        // environments, which a running uvx tool may be executing from.
+        Pruner::Uv => {
+            let mut c = Command::new("uv");
+            c.args(["cache", "prune", "--cache-dir"])
+                .arg(&dir.path)
+                .env("UV_LOCK_TIMEOUT", PRUNE_LOCK_TIMEOUT_SECS);
+            c
+        }
+    };
+    let outcome = run_quietly(&mut command, pruner);
+
+    let remaining = if dir.path.exists() {
+        dir_stats(&dir.path).0
+    } else {
+        0
+    };
+
+    (dir.size.saturating_sub(remaining), outcome.err())
+}
+
+/// Runs a pruner and reduces a failure to the one line that says why.
+fn run_quietly(command: &mut Command, pruner: Pruner) -> Result<(), String> {
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| match e.kind() {
+            ErrorKind::NotFound => format!("cannot run `{}`: not on PATH", pruner.command()),
+            _ => e.to_string(),
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .find(|line| line.starts_with("error"))
+        .or_else(|| stderr.lines().rfind(|line| !line.trim().is_empty()))
+        .unwrap_or("exited with an error");
+    Err(reason.trim().to_string())
 }
 
 /// Deletes one directory, prints the outcome, and returns the bytes reclaimed.
@@ -297,11 +412,16 @@ fn clear_readonly(root: &Path) {
 }
 
 fn confirm(prompt: &str) -> bool {
+    ask(prompt) == "y"
+}
+
+/// The answer, trimmed and lowercased.
+fn ask(prompt: &str) -> String {
     print!("{prompt}");
     io::stdout().flush().unwrap();
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
-    input.trim().eq_ignore_ascii_case("y")
+    input.trim().to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -330,6 +450,31 @@ mod tests {
     fn except_rejects_a_name_that_is_no_category_at_all() {
         assert!(check("brwoser-caches").is_err());
         assert!(check("").is_err());
+    }
+
+    // uv prints progress before the reason, and the reason is what to show.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_failed_prune_reports_the_error_line() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "echo 'Cache is in use, waiting' >&2; echo 'error: Timeout (10s)' >&2; exit 2",
+        ]);
+
+        assert_eq!(
+            run_quietly(&mut command, Pruner::Uv),
+            Err("error: Timeout (10s)".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_missing_pruner_says_so() {
+        let mut command = Command::new("diskscout-test-no-such-program");
+
+        let error = run_quietly(&mut command, Pruner::Uv).unwrap_err();
+
+        assert!(error.contains("not on PATH"), "{error}");
     }
 
     // An abandoned Instruments recording is a loose file, not a directory.

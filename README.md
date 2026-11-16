@@ -64,7 +64,7 @@ signature and notarization instead.
 | --- | --- | --- |
 | `--path <DIR>` | `$HOME` | Scan this subtree instead of the home directory. |
 | `--delete` | off | Prompt per category after the report. |
-| `--delete-safe` | off | Delete every category marked regenerable, one confirmation. |
+| `--delete-safe` | off | Delete every category marked regenerable and prune the uv cache, one confirmation. |
 | `--delete-targets` | off | Delete every Rust `target/` directory, no prompts. |
 | `-y`, `--yes` | off | Answer yes to the `--delete-safe` confirmation. |
 | `--except <CAT>` | none | Categories `--delete-safe` must leave alone. Comma-separated. |
@@ -92,11 +92,11 @@ still apply, so `--path /` still leaves `/System` alone.
 
 Every line of the `--delete-safe` preview prints the slug to exclude it:
 
-    About to delete these categories:
+    About to clean these categories:
       Instruments traces        54.4 GB  (10 dirs, --except instruments-traces)
       macOS Caches              36.4 GB  (193 dirs, --except macos-caches)
-      App web caches            18.6 GB  (123 dirs, --except app-web-caches)
-      TOTAL                    269.4 GB
+      uv cache                   2.3 GB  (uv cache prune, unused entries only, --except uv-cache)
+      TOTAL                    269.4 GB  (plus whatever the prunes free)
 
     diskscout --delete-safe --except instruments-traces,macos-caches
 
@@ -163,11 +163,19 @@ Thirty of the forty-eight categories are tagged **safe to delete**: regenerable 
 demand, costing a rebuild or a re-download but never data. `--delete-safe` takes exactly
 these.
 
-The other eighteen are tagged **review carefully** and `--delete-safe` never touches them,
+One, the uv cache, is **pruned by --delete-safe** instead: every `uvx` run and new
+virtualenv installs out of it, so clearing it means re-downloading on the next one.
+`--delete-safe` runs `uv cache prune`, which drops only what nothing references, and reports
+what that actually freed. If another uv process holds the cache, the prune gives up after
+ten seconds and says so; it never passes `--force`, because prune also removes cached
+environments a running `uvx` tool may be executing from. `--delete` offers the choice of
+pruning it or deleting all of it.
+
+The other seventeen are tagged **review carefully** and `--delete-safe` never touches them,
 whatever `--except` says. Virtualenvs, framework build directories, DerivedData, simulators
-and their runtimes, iPhone backups, browser caches, the uv cache, the cloud mirror, the
-caches that cost hours to rebuild, `Windows.old`, the installer payload cache still needed to repair or uninstall, Docker and
-WSL data, the Android SDK and emulator images. They are still measured and still reported,
+and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
+hours to rebuild, `Windows.old`, the installer payload cache still needed to repair or
+uninstall, Docker and WSL data, the Android SDK and emulator images. They are still measured and still reported,
 because knowing where the space went is useful even when removing it is your call.
 
 Directories the OS and running apps expect to keep existing are emptied rather than removed:
@@ -230,10 +238,9 @@ and per-user installs under `%LOCALAPPDATA%\Programs` on Windows.
 **Caches that cost more than a download.** Photo and media analysis run over the whole
 library, so clearing them buys a few hundred megabytes and spends hours of CPU re-deriving
 what was already there. Siri's downloaded voices, offline map tiles, Spotify's offline
-playlists and Office's co-authoring state are the same trade in bandwidth, and so is the uv
-cache, which every `uvx` run and new virtualenv installs out of. Reported, never swept. An
-IDE index is deliberately not in that set: rebuilding it is exactly the trade the sweep
-exists to make.
+playlists and Office's co-authoring state are the same trade in bandwidth. Reported, never
+swept. An IDE index is deliberately not in that set: rebuilding it is exactly the trade the
+sweep exists to make.
 
 `~/Library/Caches` is regenerable by definition and the sweep takes all of it, so the few
 entries where that is untrue are named individually rather than assumed.
@@ -314,8 +321,8 @@ fails rather than ships.
 `report::SECTION_CATS` is the single list of categories in display order. The cleaner walks
 it too, so a category cannot be reported without being deletable or the reverse.
 
-`Category` carries its own policy: `safe_to_delete()` for whether `--delete-safe` may take
-it, `delete_contents_only()` for whether the directory itself must survive, and `slug()`
+`Category` carries its own policy: `sweep()` for whether `--delete-safe` removes it, prunes
+it through its owning tool, or leaves it for review, `delete_contents_only()` for whether the directory itself must survive, and `slug()`
 derived from the display label so the CLI name cannot drift from what the report prints.
 Adding a category means adding a variant, a label, and a line in `SECTION_CATS`; the
 compiler finds the rest.

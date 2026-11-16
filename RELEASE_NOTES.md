@@ -1,10 +1,15 @@
-## v0.2.1
+## v0.2.2
 
-**Fixes `__bootstrap` adding a redundant `compinit` to every zsh startup by probing zsh first and editing `.zshenv`/`.zshrc` only when completions are not already loaded.**
+**Changes `--delete-safe` to prune the uv cache with `uv cache prune` instead of skipping it, and adds a prune option to `--delete`.**
 
-### Fixed
+### Changed
 
-- **`__bootstrap` added a second `compinit` to zsh startup**: The zsh path appended its own `fpath` line and `compinit` to `.zshrc` behind a `# diskscout completions` marker. Behind oh-my-zsh or any other `compinit`, this forced a second full completion-cache rebuild on every shell start, and deleting the block brought it back on the next install. Bootstrap now asks a fresh `zsh -i` whether `~/.zsh/completions` already loads and edits only when it does not.
-  - The `fpath` line goes into `~/.zshenv`.
-  - A `compinit` is added to `.zshrc` only when nothing else runs one.
-  - The old marker block is removed as an exact match once a probe has succeeded. If zsh cannot be run, nothing is edited.
+- **`--delete-safe` prunes the uv cache**: `--delete-safe` now runs `uv cache prune`, which drops only entries nothing references, and reports how much it freed. The cache is no longer held back (an intermediate approach that treated it as review-carefully was replaced), so a bulk sweep no longer forces a full re-download on the next `uvx` run or new virtualenv.
+  - The prune sets `UV_LOCK_TIMEOUT` because uv otherwise waits on a held cache for as long as the holder runs. A busy cache is reported as skipped.
+  - `--force` is never passed, because prune also removes cached environments that a running `uvx` tool may be executing from.
+  - `--delete` offers three choices for the uv cache: prune, delete all, or skip.
+  - The `--delete-safe` help text mentions the uv prune.
+
+### Internal
+
+- Modeled per-category cleanup policy as a `Sweep` (clean by removal, clean by prune, or review) matched exhaustively, so a new category must choose a policy and a review-carefully category cannot reach the cleaner.

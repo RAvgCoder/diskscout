@@ -196,7 +196,6 @@ impl Category {
         match self {
             Category::RustTarget
             | Category::XcodeDerivedData
-            | Category::NodeModules
             | Category::PythonBytecode
             | Category::SwiftPmBuild
             | Category::DotNetBuild
@@ -205,7 +204,6 @@ impl Category {
             | Category::XcTestDevices
             | Category::MacOsCaches
             | Category::XcodeDeviceSupport
-            | Category::XcodeCaches
             | Category::InstrumentsTraces
             | Category::AppWebCache
             | Category::ContainerCaches
@@ -215,20 +213,12 @@ impl Category {
             | Category::CrashDumps
             | Category::WindowsCaches
             | Category::ThumbnailCache
-            | Category::NpmCache
-            | Category::YarnPnpmCache
-            | Category::HomebrewCache
-            | Category::PipCache
-            | Category::NugetCache
-            | Category::CargoRegistry
-            | Category::GradleCache
-            | Category::MavenCache
-            | Category::GoModCache
             | Category::IdeCache => Sweep::Clean(Clean::Remove(Guard::Always)),
             Category::UvCache => Sweep::Clean(Clean::Prune(Pruner::Uv)),
             Category::ClaudeTemp => Sweep::Review(Guard::SessionEnded),
             // Only the network brings these back.
             Category::SwiftPackages => Sweep::Review(Guard::Always),
+            // Only the network brings these back.
             Category::PythonEnv
             | Category::NextJs
             | Category::Nuxt
@@ -244,7 +234,18 @@ impl Category {
             | Category::InstallerCache
             | Category::DockerData
             | Category::AndroidSdk
-            | Category::AndroidEmulator => Sweep::Review(Guard::Always),
+            | Category::AndroidEmulator
+            | Category::NodeModules
+            | Category::NpmCache
+            | Category::YarnPnpmCache
+            | Category::PipCache
+            | Category::NugetCache
+            | Category::CargoRegistry
+            | Category::GradleCache
+            | Category::MavenCache
+            | Category::GoModCache
+            | Category::HomebrewCache
+            | Category::XcodeCaches => Sweep::Review(Guard::Always),
         }
     }
 
@@ -275,7 +276,7 @@ impl Category {
             | Category::AppWebCache
             | Category::ContainerCaches
             | Category::ExpensiveCache => Removal::Contents,
-            Category::XcodeDerivedData => Removal::KeepingPackages,
+            Category::XcodeDerivedData | Category::SwiftPmBuild => Removal::KeepingPackages,
             Category::RustTarget
             | Category::NodeModules
             | Category::PythonBytecode
@@ -284,7 +285,6 @@ impl Category {
             | Category::Nuxt
             | Category::SvelteKit
             | Category::CocoaPods
-            | Category::SwiftPmBuild
             | Category::DotNetBuild
             | Category::VisualStudioCache
             | Category::GradleBuild
@@ -530,7 +530,7 @@ impl Scanner {
         let packages: Vec<PathBuf> = pending
             .iter()
             .filter(|(_, category)| category.removal() == Removal::KeepingPackages)
-            .flat_map(|(path, _)| derived_data_packages(path))
+            .flat_map(|(path, _)| downloaded_packages(path))
             .collect();
         pending.extend(
             packages
@@ -902,19 +902,29 @@ fn is_package_checkouts(dir: &Path) -> bool {
         || dir.join("workspace-state.json").is_file()
 }
 
-/// The downloaded Swift packages in a DerivedData folder, or in each project
-/// folder of a DerivedData root. Found by name, since a trimmed project folder
-/// no longer has the layout that marks it as DerivedData.
-pub fn derived_data_packages(path: &Path) -> Vec<PathBuf> {
+/// What a build folder downloaded: a DerivedData folder's `SourcePackages`, or
+/// that of each project folder in a DerivedData root, and the checkouts and
+/// state SwiftPM keeps in `.build`. Found by name, since a trimmed project
+/// folder no longer has the layout that marks it as DerivedData.
+pub fn downloaded_packages(path: &Path) -> Vec<PathBuf> {
     let children: Vec<PathBuf> = std::fs::read_dir(path).map_or_else(
         |_| Vec::new(),
         |entries| entries.flatten().map(|entry| entry.path()).collect(),
     );
-    std::iter::once(path.to_path_buf())
+    let derived_data = std::iter::once(path.to_path_buf())
         .chain(children)
         .map(|dir| dir.join("SourcePackages"))
-        .filter(|packages| packages.is_dir())
-        .collect()
+        .filter(|packages| packages.is_dir());
+    let swiftpm = [
+        "checkouts",
+        "repositories",
+        "artifacts",
+        "workspace-state.json",
+    ]
+    .iter()
+    .map(|name| path.join(name))
+    .filter(|kept| kept.exists());
+    derived_data.chain(swiftpm).collect()
 }
 
 // An Electron app ships its dependencies inside its own install directory, so
@@ -1422,6 +1432,35 @@ mod tests {
     }
 
     #[test]
+    fn swiftpm_keeps_what_it_downloaded() {
+        let td = tempdir().unwrap();
+        let build = td.path().join(".build");
+        for sub in [
+            "checkouts",
+            "repositories",
+            "artifacts",
+            "arm64-apple-macosx/debug",
+        ] {
+            fs::create_dir_all(build.join(sub)).unwrap();
+        }
+        fs::write(build.join("workspace-state.json"), "{}").unwrap();
+
+        let mut kept = downloaded_packages(&build);
+        kept.sort();
+
+        assert_eq!(
+            kept,
+            vec![
+                build.join("artifacts"),
+                build.join("checkouts"),
+                build.join("repositories"),
+                build.join("workspace-state.json"),
+            ]
+        );
+        assert_eq!(Category::SwiftPmBuild.removal(), Removal::KeepingPackages);
+    }
+
+    #[test]
     fn packages_are_found_in_a_derived_data_folder_and_in_its_projects() {
         let td = tempdir().unwrap();
         let single = td.path().join("dd");
@@ -1431,11 +1470,11 @@ mod tests {
         fs::create_dir_all(root.join("ModuleCache.noindex")).unwrap();
 
         assert_eq!(
-            derived_data_packages(&single),
+            downloaded_packages(&single),
             vec![single.join("SourcePackages")]
         );
         assert_eq!(
-            derived_data_packages(&root),
+            downloaded_packages(&root),
             vec![root.join("App-abc/SourcePackages")]
         );
     }
@@ -1488,10 +1527,21 @@ mod tests {
             Category::RustTarget.sweep(),
             Sweep::Clean(Clean::Remove(Guard::Always))
         );
-        assert_eq!(
-            Category::NodeModules.sweep(),
-            Sweep::Clean(Clean::Remove(Guard::Always))
-        );
+        // Reinstalling these needs the network, so they are kept offline-safe.
+        for needs_network in [
+            Category::NodeModules,
+            Category::NpmCache,
+            Category::YarnPnpmCache,
+            Category::CargoRegistry,
+            Category::HomebrewCache,
+            Category::XcodeCaches,
+        ] {
+            assert_eq!(
+                needs_network.sweep(),
+                Sweep::Review(Guard::Always),
+                "{needs_network:?}"
+            );
+        }
         // A clean build and a reindex, never data.
         assert_eq!(
             Category::XcodeDerivedData.sweep(),

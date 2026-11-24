@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime};
 use crate::claude_code::{self, Sessions};
 use crate::report::all_categories;
 use crate::scanner::{
-    Category, Clean, FoundDir, Guard, Pruner, Removal, ScanResult, Sweep, derived_data_packages,
-    dir_stats, display_path, fmt_size,
+    Category, Clean, FoundDir, Guard, Pruner, Removal, ScanResult, Sweep, dir_stats, display_path,
+    downloaded_packages, fmt_size,
 };
 
 /// How long a pruner may wait on a cache another process holds before giving up.
@@ -392,7 +392,7 @@ fn remove(dir: &FoundDir) -> (u64, Option<String>) {
     let removal = dir.category.removal();
     let mut keep = claude_dirs_inside(&dir.path);
     match removal {
-        Removal::KeepingPackages => keep.extend(derived_data_packages(&dir.path)),
+        Removal::KeepingPackages => keep.extend(downloaded_packages(&dir.path)),
         Removal::Whole | Removal::Contents => {}
     }
 

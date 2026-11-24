@@ -73,6 +73,66 @@ fn env_path(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Where Claude Code puts its per-user temp folder, in the order it checks.
+pub fn claude_temp_bases() -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = env_path("CLAUDE_CODE_TMPDIR").into_iter().collect();
+    #[cfg(windows)]
+    bases.push(
+        env_path("TEMP")
+            .or_else(|| env_path("TMP"))
+            .unwrap_or_else(std::env::temp_dir),
+    );
+    // Claude Code ignores $TMPDIR on macOS, which points under /var/folders.
+    #[cfg(target_os = "macos")]
+    bases.push(PathBuf::from("/tmp"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    bases.push(
+        env_path("TMPDIR")
+            .or_else(|| env_path("TMP"))
+            .or_else(|| env_path("TEMP"))
+            .unwrap_or_else(|| PathBuf::from("/tmp")),
+    );
+    bases
+}
+
+/// Shared temp directories walked for build output. Windows has none: its
+/// %TEMP% is a fixed target cleared as a whole.
+pub fn temp_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        Vec::new()
+    }
+    #[cfg(not(windows))]
+    {
+        let tmp = PathBuf::from("/tmp");
+        vec![std::fs::canonicalize(&tmp).unwrap_or(tmp)]
+    }
+}
+
+/// Every process ID running now, or None when the process list cannot be read.
+pub fn running_pids() -> Option<std::collections::HashSet<u32>> {
+    #[cfg(windows)]
+    let (program, args, column) = ("tasklist", &["/FO", "CSV", "/NH"][..], 1);
+    #[cfg(not(windows))]
+    let (program, args, column) = ("ps", &["-A", "-o", "pid="][..], 0);
+
+    let output = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let pids: std::collections::HashSet<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.split(',')
+                .nth(column)
+                .and_then(|field| field.trim().trim_matches('"').parse().ok())
+        })
+        .collect();
+    (!pids.is_empty()).then_some(pids)
+}
+
 /// True for files that report a size but hold no local blocks, so counting them
 /// would invent reclaimable space that deleting them cannot return.
 #[cfg(windows)]
@@ -758,15 +818,11 @@ fn container_caches_in(containers: &Path, providers: &[String]) -> Vec<(PathBuf,
 /// Build caches that live outside any project directory.
 #[cfg(not(windows))]
 pub fn build_cache_targets(home: &Path) -> Vec<(PathBuf, Category)> {
-    // Check both the persistent build cache location and the legacy /tmp path.
-    [
-        home.join(".build_caches/cargo"),
-        PathBuf::from("/tmp/cargo-target"),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .map(|p| (p, Category::RustTarget))
-    .collect()
+    [home.join(".build_caches/cargo")]
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| (p, Category::RustTarget))
+        .collect()
 }
 
 /// Files the OS reserves that cannot be deleted directly, reported for
@@ -1184,7 +1240,7 @@ mod size_tests {
 #[cfg(test)]
 mod target_tests {
     use super::*;
-    use crate::scanner::Sweep;
+    use crate::scanner::{Guard, Sweep};
 
     #[test]
     fn a_web_cache_is_found_at_every_depth_and_never_descended_into() {
@@ -1461,7 +1517,10 @@ mod target_tests {
 
     #[test]
     fn the_protected_caches_are_never_auto_deleted() {
-        assert_eq!(Category::ExpensiveCache.sweep(), Sweep::Review);
+        assert_eq!(
+            Category::ExpensiveCache.sweep(),
+            Sweep::Review(Guard::Always)
+        );
         assert!(Category::ExpensiveCache.delete_contents_only());
     }
 
@@ -1490,7 +1549,7 @@ mod target_tests {
 
     #[test]
     fn a_sync_container_is_never_offered_for_deletion() {
-        assert_eq!(Category::CloudMirror.sweep(), Sweep::Review);
+        assert_eq!(Category::CloudMirror.sweep(), Sweep::Review(Guard::Always));
     }
 
     // ~/Library/Caches is regenerable by definition, which is why the sweep

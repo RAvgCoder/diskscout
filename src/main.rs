@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod bootstrap;
+mod claude_code;
 mod cleaner;
 mod dump;
 mod platform;

@@ -2,6 +2,7 @@ use colored::Colorize;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use crate::claude_code::Sessions;
 use crate::scanner::{Category, FoundFile, LargeDir, ScanResult, display_path, fmt_age, fmt_size};
 
 // Sections whose categories are all empty are skipped when printing, so the
@@ -24,6 +25,7 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
             Category::GradleBuild,
         ],
     ),
+    ("TEMP FOLDERS", &[Category::TempBuild, Category::ClaudeTemp]),
     (
         "MACOS & XCODE",
         &[
@@ -98,6 +100,7 @@ pub(crate) fn all_categories() -> impl Iterator<Item = Category> {
 const STALE_DAYS: u64 = 180;
 
 pub fn print_report(result: &ScanResult, home: &Path) {
+    let sessions = Sessions::load(home);
     println!();
     println!("{}", "diskscout -- storage cleanup report".bold());
     println!("{}", "─".repeat(60).dimmed());
@@ -133,11 +136,35 @@ pub fn print_report(result: &ScanResult, home: &Path) {
                 fmt_size(cat_total).bold(),
                 safe_label
             );
+            if *cat == Category::ClaudeTemp {
+                let inside: u64 = result
+                    .dirs_by_category(Category::TempBuild)
+                    .iter()
+                    .filter(|build| dirs.iter().any(|d| build.path.starts_with(&d.path)))
+                    .map(|build| build.size)
+                    .sum();
+                if inside > 0 {
+                    println!(
+                        "      {}",
+                        format!(
+                            "plus {} of build output inside, listed under {}",
+                            fmt_size(inside),
+                            Category::TempBuild.label()
+                        )
+                        .dimmed()
+                    );
+                }
+            }
 
             for dir in dirs.iter().take(8) {
                 let age = fmt_age(dir.last_modified);
+                let running = if *cat == Category::ClaudeTemp && sessions.is_running(&dir.path) {
+                    "  running".yellow().to_string()
+                } else {
+                    String::new()
+                };
                 println!(
-                    "      {:>10}  {}  {}",
+                    "      {:>10}  {}  {}{running}",
                     fmt_size(dir.size).green(),
                     display_path(&dir.path, home).dimmed(),
                     format!("({age})").dimmed()

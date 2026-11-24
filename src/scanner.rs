@@ -46,9 +46,8 @@ pub enum Clean {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Guard {
     Always,
-    /// Nothing in it was written recently, so no build is still running in it.
-    Idle,
-    /// No running Claude Code session owns it, and it is idle.
+    /// No running Claude Code session owns it, and nothing in it was written
+    /// recently.
     SessionEnded,
 }
 
@@ -80,8 +79,7 @@ pub enum Category {
     DotNetBuild,
     VisualStudioCache,
     GradleBuild,
-    // Temp directories, located by where they are rather than what they are.
-    TempBuild,
+    // What a Claude Code session leaves in its temp folder besides build output.
     ClaudeTemp,
     // macOS system directories.
     XcodeDerivedData,
@@ -141,7 +139,6 @@ impl Category {
             Category::DotNetBuild => ".NET bin/ + obj/",
             Category::VisualStudioCache => "Visual Studio .vs/",
             Category::GradleBuild => "Gradle build/",
-            Category::TempBuild => "Temp build output",
             Category::ClaudeTemp => "Claude Code temp",
             Category::XcodeDerivedData => "Xcode DerivedData",
             Category::XcTestDevices => "XCTest simulator clones",
@@ -217,7 +214,6 @@ impl Category {
             | Category::GoModCache
             | Category::IdeCache => Sweep::Clean(Clean::Remove(Guard::Always)),
             Category::UvCache => Sweep::Clean(Clean::Prune(Pruner::Uv)),
-            Category::TempBuild => Sweep::Clean(Clean::Remove(Guard::Idle)),
             Category::ClaudeTemp => Sweep::Review(Guard::SessionEnded),
             Category::PythonEnv
             | Category::NextJs
@@ -472,18 +468,7 @@ impl Scanner {
 
         spinner.finish_and_clear();
 
-        // Build output under a temp root is classed by where it is: a scratch
-        // build nobody will open again, whatever kind it was.
-        let mut pending: Vec<(PathBuf, Category)> = hits
-            .into_iter()
-            .map(|(path, kind)| {
-                if temp_roots.iter().any(|root| path.starts_with(root)) {
-                    (path, Category::TempBuild)
-                } else {
-                    (path, kind)
-                }
-            })
-            .collect();
+        let mut pending = hits;
         pending.extend(system);
         pending.extend(platform::build_cache_targets(&self.config.home));
 
@@ -506,7 +491,7 @@ impl Scanner {
                     .filter(|dir| dir.starts_with(&path) && **dir != path)
                     .cloned()
                     .collect();
-                let (size, last_modified) = dir_stats_excluding(&path, &carved);
+                let (size, last_modified) = dir_stats(&path, &carved);
                 pb.inc(1);
                 FoundDir {
                     path,
@@ -624,7 +609,13 @@ impl Scanner {
         let mut all_stats: Vec<(PathBuf, u64, SystemTime)> = candidates
             .into_par_iter()
             .map(|path| {
-                let (size, last_modified) = dir_stats(&path);
+                // What a category already reports inside it is not unexplored.
+                let reported: Vec<PathBuf> = categorized
+                    .iter()
+                    .filter(|c| c.path.starts_with(&path))
+                    .map(|c| c.path.clone())
+                    .collect();
+                let (size, last_modified) = dir_stats(&path, &reported);
                 pb.inc(1);
                 (path, size, last_modified)
             })
@@ -894,7 +885,7 @@ fn claude_sessions(claude_dirs: &[PathBuf], found: &[FoundDir]) -> Vec<FoundDir>
                 .filter(|dir| dir.path.starts_with(&entry))
                 .collect();
             let excluded: Vec<PathBuf> = inside.iter().map(|dir| dir.path.clone()).collect();
-            let (size, own_newest) = dir_stats_excluding(&entry, &excluded);
+            let (size, own_newest) = dir_stats(&entry, &excluded);
             let last_modified = inside
                 .iter()
                 .map(|dir| dir.last_modified)
@@ -940,12 +931,7 @@ fn keep_outermost(
 // Computes total size and most-recent modification time in a single walk.
 // Hard links are counted once per walk, so a blob linked from two targets is
 // still counted twice; nothing observed links across targets.
-pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
-    dir_stats_excluding(path, &[])
-}
-
-/// `dir_stats` with whole subtrees left out.
-pub fn dir_stats_excluding(path: &Path, excluded: &[PathBuf]) -> (u64, SystemTime) {
+pub fn dir_stats(path: &Path, excluded: &[PathBuf]) -> (u64, SystemTime) {
     let mut size = 0u64;
     let mut newest = SystemTime::UNIX_EPOCH;
     let mut linked = HashSet::new();
@@ -963,7 +949,9 @@ pub fn dir_stats_excluding(path: &Path, excluded: &[PathBuf]) -> (u64, SystemTim
                 continue;
             }
             size += platform::size_on_disk(entry.path(), &meta);
-            if let Ok(modified) = meta.modified()
+            // Finder rewrites it whenever the folder is viewed, so it dates nothing.
+            if entry.file_name() != ".DS_Store"
+                && let Ok(modified) = meta.modified()
                 && modified > newest
             {
                 newest = modified;
@@ -1264,14 +1252,35 @@ mod tests {
         let kept = keep_outermost(
             vec![
                 (temp.clone(), Category::WindowsTemp),
-                (build.clone(), Category::TempBuild),
-                (nested.clone(), Category::TempBuild),
+                (build.clone(), Category::XcodeDerivedData),
+                (nested.clone(), Category::XcodeDerivedData),
             ],
             std::slice::from_ref(&claude),
         );
 
         let paths: Vec<&PathBuf> = kept.iter().map(|(p, _)| p).collect();
         assert_eq!(paths, vec![&temp, &build], "{kept:?}");
+    }
+
+    // Browsing a scratch build in Finder must not make it look in use.
+    #[test]
+    fn finder_metadata_does_not_date_a_folder() {
+        let td = tempdir().unwrap();
+        let build = td.path().join("out.o");
+        fs::write(&build, vec![1u8; 4_096]).unwrap();
+        let built = SystemTime::now() - Duration::from_secs(3 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&build)
+            .unwrap()
+            .set_modified(built)
+            .unwrap();
+        fs::write(td.path().join(".DS_Store"), vec![1u8; 4_096]).unwrap();
+
+        let (size, newest) = dir_stats(td.path(), &[]);
+
+        assert_eq!(newest, built);
+        assert!(size >= 8_192, "{size}");
     }
 
     #[test]
@@ -1284,11 +1293,11 @@ mod tests {
         fs::write(kept.join("a"), vec![1u8; 8_192]).unwrap();
         fs::write(cut.join("b"), vec![1u8; 65_536]).unwrap();
 
-        let (whole, _) = dir_stats(td.path());
-        let (rest, _) = dir_stats_excluding(td.path(), std::slice::from_ref(&cut));
+        let (whole, _) = dir_stats(td.path(), &[]);
+        let (rest, _) = dir_stats(td.path(), std::slice::from_ref(&cut));
 
-        assert_eq!(whole - rest, dir_stats(&cut).0);
-        assert_eq!(dir_stats_excluding(&cut, std::slice::from_ref(&cut)).0, 0);
+        assert_eq!(whole - rest, dir_stats(&cut, &[]).0);
+        assert_eq!(dir_stats(&cut, std::slice::from_ref(&cut)).0, 0);
     }
 
     // Agents name these after the run: cargo-target, target-orch, lto-target.
@@ -1332,7 +1341,7 @@ mod tests {
         fs::write(&original, vec![0u8; 8_192]).unwrap();
         fs::hard_link(&original, td.path().join("linked")).unwrap();
 
-        let (size, _) = dir_stats(td.path());
+        let (size, _) = dir_stats(td.path(), &[]);
         assert_eq!(size, 8_192, "the second link is the same allocation");
     }
 
@@ -1481,7 +1490,7 @@ mod tests {
         fs::create_dir_all(td.path().join("a/b")).unwrap();
         fs::write(td.path().join("a/one.bin"), vec![0u8; 100]).unwrap();
         fs::write(td.path().join("a/b/two.bin"), vec![0u8; 250]).unwrap();
-        let (size, newest) = dir_stats(td.path());
+        let (size, newest) = dir_stats(td.path(), &[]);
         assert_eq!(size, 350);
         assert!(newest > SystemTime::UNIX_EPOCH);
     }
@@ -1489,7 +1498,7 @@ mod tests {
     #[test]
     fn dir_stats_on_an_empty_dir_is_zero() {
         let td = tempdir().unwrap();
-        let (size, newest) = dir_stats(td.path());
+        let (size, newest) = dir_stats(td.path(), &[]);
         assert_eq!(size, 0);
         assert_eq!(newest, SystemTime::UNIX_EPOCH);
     }

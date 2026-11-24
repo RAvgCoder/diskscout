@@ -25,7 +25,7 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
             Category::GradleBuild,
         ],
     ),
-    ("TEMP FOLDERS", &[Category::TempBuild, Category::ClaudeTemp]),
+    ("TEMP FOLDERS", &[Category::ClaudeTemp]),
     (
         "MACOS & XCODE",
         &[
@@ -138,18 +138,18 @@ pub fn print_report(result: &ScanResult, home: &Path) {
             );
             if *cat == Category::ClaudeTemp {
                 let inside: u64 = result
-                    .dirs_by_category(Category::TempBuild)
+                    .dirs
                     .iter()
-                    .filter(|build| dirs.iter().any(|d| build.path.starts_with(&d.path)))
-                    .map(|build| build.size)
+                    .filter(|found| found.category != Category::ClaudeTemp)
+                    .filter(|found| dirs.iter().any(|d| found.path.starts_with(&d.path)))
+                    .map(|found| found.size)
                     .sum();
                 if inside > 0 {
                     println!(
                         "      {}",
                         format!(
-                            "plus {} of build output inside, listed under {}",
-                            fmt_size(inside),
-                            Category::TempBuild.label()
+                            "plus {} of build output inside, listed under its own categories",
+                            fmt_size(inside)
                         )
                         .dimmed()
                     );

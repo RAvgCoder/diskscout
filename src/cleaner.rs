@@ -9,15 +9,14 @@ use std::time::{Duration, SystemTime};
 use crate::claude_code::{self, Sessions};
 use crate::report::all_categories;
 use crate::scanner::{
-    Category, Clean, FoundDir, Guard, Pruner, ScanResult, Sweep, dir_stats_excluding, display_path,
-    fmt_size,
+    Category, Clean, FoundDir, Guard, Pruner, ScanResult, Sweep, dir_stats, display_path, fmt_size,
 };
 
 /// How long a pruner may wait on a cache another process holds before giving up.
-const PRUNE_LOCK_TIMEOUT_SECS: &str = "10";
+const PRUNE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A guarded directory written to more recently than this may have a build or
-/// a session still working in it.
+/// A Claude Code session folder written to more recently than this may belong
+/// to a headless run, which the session registry does not list.
 const IDLE_BEFORE_DELETE: Duration = Duration::from_secs(60 * 60);
 
 pub fn delete_category(result: &ScanResult, category: Category, home: &Path) {
@@ -259,7 +258,6 @@ fn clean_reporting(
 fn allowed(clean: Clean, dir: &FoundDir, sessions: &Sessions) -> Result<(), String> {
     match clean {
         Clean::Remove(Guard::Always) | Clean::Prune(_) => Ok(()),
-        Clean::Remove(Guard::Idle) => idle(dir),
         Clean::Remove(Guard::SessionEnded) => {
             if sessions.may_be_running(&dir.path) {
                 return Err("a Claude Code session may still be using it".to_owned());
@@ -323,14 +321,14 @@ fn prune(dir: &FoundDir, pruner: Pruner) -> (u64, Option<String>) {
             let mut c = Command::new("uv");
             c.args(["cache", "prune", "--cache-dir"])
                 .arg(&dir.path)
-                .env("UV_LOCK_TIMEOUT", PRUNE_LOCK_TIMEOUT_SECS);
+                .env("UV_LOCK_TIMEOUT", PRUNE_LOCK_TIMEOUT.as_secs().to_string());
             c
         }
     };
     let outcome = run_quietly(&mut command, pruner);
 
     let remaining = if dir.path.exists() {
-        dir_stats_excluding(&dir.path, &[]).0
+        dir_stats(&dir.path, &[]).0
     } else {
         0
     };
@@ -398,7 +396,7 @@ fn remove(dir: &FoundDir) -> (u64, Option<String>) {
     };
 
     let remaining = if dir.path.exists() {
-        dir_stats_excluding(&dir.path, &keep).0
+        dir_stats(&dir.path, &keep).0
     } else {
         0
     };

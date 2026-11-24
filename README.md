@@ -106,17 +106,28 @@ silently ignored, because a typo would otherwise delete the thing you meant to k
 
 ## What it finds
 
-Forty-eight categories in six sections. A section whose categories are all empty is not
+Forty-nine categories in seven sections. A section whose categories are all empty is not
 printed, so each machine sees only what applies to it.
 
 **Build artifacts** are found by walking, and a directory only counts when the marker that
 explains it sits beside it: `target/` next to a `Cargo.toml`, `build/` next to a
 `build.gradle`, `bin/` and `obj/` next to a `.csproj`. Covers Rust, `node_modules`,
 `__pycache__`, virtualenvs, Next.js, Nuxt, SvelteKit, CocoaPods, SwiftPM `.build/`, .NET,
-Visual Studio `.vs/`, Gradle `build/`, `.gradle/` and NDK `.cxx/`. A matched directory is
-not descended into, so a 4 GB `node_modules` is one entry rather than 30,000.
+Visual Studio `.vs/`, Gradle `build/`, `.gradle/` and NDK `.cxx/`. A Cargo target is also
+recognised by the `.rustc_info.json` Cargo writes into it, whatever the folder is called. A
+matched directory is not descended into, so a 4 GB `node_modules` is one entry rather than
+30,000.
 
-**macOS and Xcode** covers DerivedData wherever it lives, XCTest simulator clones, the
+**Temp folders.** `/tmp` is walked exactly like the home directory, as if it had been
+passed with `--path`, so build output there lands in its usual category. Claude Code's own
+temp folder is walked the same way wherever it lives: `/tmp/claude-<uid>` on macOS, where
+Claude Code ignores `$TMPDIR`, under `$TMPDIR` on Linux, `%TEMP%\claude-0` on Windows, and
+under `$CLAUDE_CODE_TMPDIR` wherever that is set. What is left of each session folder once
+its build output is counted is its own category, one entry per session, with the build
+output inside given as a separate figure and a session still running marked.
+
+**macOS and Xcode** covers DerivedData wherever it lives, recognised by its layout so a
+`-derivedDataPath` folder counts under any name, XCTest simulator clones, the
 simulators and their runtimes, per-OS device support, the documentation cache, Instruments
 recordings, `~/Library/Caches` broken out one entry per app, and iPhone backups.
 
@@ -159,7 +170,7 @@ cache directories rather than the top eight.
 
 Deletion is permanent. Not the Trash, no undo.
 
-Thirty of the forty-eight categories are tagged **safe to delete**: regenerable on
+Thirty of the forty-nine categories are tagged **safe to delete**: regenerable on
 demand, costing a rebuild or a re-download but never data. `--delete-safe` takes exactly
 these.
 
@@ -171,15 +182,25 @@ ten seconds and says so; it never passes `--force`, because prune also removes c
 environments a running `uvx` tool may be executing from. `--delete` offers the choice of
 pruning it or deleting all of it.
 
-The other seventeen are tagged **review carefully** and `--delete-safe` never touches them,
+The other eighteen are tagged **review carefully** and `--delete-safe` never touches them,
 whatever `--except` says. Virtualenvs, framework build directories, DerivedData, simulators
 and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
 hours to rebuild, `Windows.old`, the installer payload cache still needed to repair or
-uninstall, Docker and WSL data, the Android SDK and emulator images. They are still measured and still reported,
-because knowing where the space went is useful even when removing it is your call.
+uninstall, Docker and WSL data, the Android SDK and emulator images, and Claude Code's
+session folders. They are still measured and still reported, because knowing where the
+space went is useful even when removing it is your call.
+
+A Claude Code session folder can hold the only copy of an agent's work, so even `--delete`
+removes one only when its name is a session ID, no running Claude Code process has that
+session open, and nothing in it was written in the last hour. Running sessions are read
+from the registry Claude Code keeps in `~/.claude/sessions`; headless runs do not register,
+which is what the hour covers. Finder's `.DS_Store` does not count as a write, because
+Finder rewrites it whenever a folder is viewed. If the registry cannot be read, no session
+folder goes.
 
 Directories the OS and running apps expect to keep existing are emptied rather than removed:
-`%TEMP%`, an app's own cache directory. A cache with open handles
+`%TEMP%`, an app's own cache directory. Emptying `%TEMP%` leaves Claude Code's folder inside
+it alone. A cache with open handles
 deletes partially, and the report says how much actually came back rather than assuming the
 whole figure did.
 
@@ -302,7 +323,7 @@ Windows is not covered by that gate, so check it explicitly when touching `platf
 
     cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-Fifty tests cover directory classification and the marker files it requires, the size
+Sixty-nine tests cover directory classification and the marker files it requires, the size
 accounting including the sparse and hard-link cases, category slugs and their uniqueness,
 the deletion policy, and each refusal rule above. The rules that exist because something
 broke are pinned by a test naming the failure, so a future change that reintroduces the bug
@@ -316,13 +337,15 @@ fails rather than ships.
     src/cleaner.rs     the three delete modes
     src/dump.rs        the untruncated report file
     src/bootstrap.rs   install and shell completions
+    src/claude_code.rs Claude Code's temp folders and its running-session registry
     src/platform.rs    every OS difference, and nothing else
 
 `report::SECTION_CATS` is the single list of categories in display order. The cleaner walks
 it too, so a category cannot be reported without being deletable or the reverse.
 
 `Category` carries its own policy: `sweep()` for whether `--delete-safe` removes it, prunes
-it through its owning tool, or leaves it for review, `delete_contents_only()` for whether the directory itself must survive, and `slug()`
-derived from the display label so the CLI name cannot drift from what the report prints.
-Adding a category means adding a variant, a label, and a line in `SECTION_CATS`; the
-compiler finds the rest.
+it through its owning tool, or leaves it for review, together with the guard checked
+just before a folder goes; `delete_contents_only()` for whether the directory itself must
+survive; and `slug()` derived from the display label so the CLI name cannot drift from what
+the report prints. `sweep()` names every category, so adding one means adding a variant, a
+label, a policy and a line in `SECTION_CATS`; the compiler finds the rest.

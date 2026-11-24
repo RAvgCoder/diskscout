@@ -1,16 +1,24 @@
 use colored::Colorize;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
+use crate::claude_code::{self, Sessions};
 use crate::report::all_categories;
 use crate::scanner::{
-    Category, Clean, FoundDir, Pruner, ScanResult, Sweep, dir_stats, display_path, fmt_size,
+    Category, Clean, FoundDir, Guard, Pruner, Removal, ScanResult, Sweep, derived_data_packages,
+    dir_stats, display_path, fmt_size,
 };
 
 /// How long a pruner may wait on a cache another process holds before giving up.
-const PRUNE_LOCK_TIMEOUT_SECS: &str = "10";
+const PRUNE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A Claude Code session folder written to more recently than this may belong
+/// to a headless run, which the session registry does not list.
+const IDLE_BEFORE_DELETE: Duration = Duration::from_secs(60 * 60);
 
 pub fn delete_category(result: &ScanResult, category: Category, home: &Path) {
     let targets = result.dirs_by_category(category);
@@ -61,7 +69,7 @@ pub fn delete_safe(
         .filter(|c| !result.dirs_by_category(*c).is_empty())
         .filter_map(|c| match c.sweep() {
             Sweep::Clean(clean) => Some((c, clean)),
-            Sweep::Review => None,
+            Sweep::Review(_) => None,
         })
         .collect();
 
@@ -93,31 +101,44 @@ pub fn delete_safe(
         println!("  {} {name}", "excluded:".yellow());
     }
 
-    // A prune frees an unknown share of its cache, so only removals are summed.
-    let total: u64 = cats
-        .iter()
-        .map(|(c, clean)| match clean {
-            Clean::Remove => result.category_total(*c),
-            Clean::Prune(_) => 0,
-        })
-        .sum();
+    let sessions = Sessions::load(home);
 
+    // A prune frees an unknown share of its cache, so only removals are summed,
+    // and only the ones their guard lets go.
+    let mut total = 0u64;
     println!();
     println!("  {}", "About to clean these categories:".bold());
     for (cat, clean) in &cats {
         let dirs = result.dirs_by_category(*cat);
-        let how = match clean {
-            Clean::Remove => format!(
-                "{} {}",
-                dirs.len(),
-                if dirs.len() == 1 { "dir" } else { "dirs" }
+        let going: Vec<&FoundDir> = dirs
+            .iter()
+            .copied()
+            .filter(|d| allowed(*clean, d, &sessions).is_ok())
+            .collect();
+        let (shown, how) = match clean {
+            Clean::Remove(_) => {
+                let size: u64 = going.iter().map(|d| d.size).sum();
+                total += size;
+                let held = dirs.len() - going.len();
+                let note = if held > 0 {
+                    format!(", {held} in use kept")
+                } else {
+                    String::new()
+                };
+                (
+                    size,
+                    format!("{} of {} dirs{note}", going.len(), dirs.len()),
+                )
+            }
+            Clean::Prune(pruner) => (
+                result.category_total(*cat),
+                format!("{}, unused entries only", pruner.command()),
             ),
-            Clean::Prune(pruner) => format!("{}, unused entries only", pruner.command()),
         };
         println!(
             "    {:<28} {:>9}  ({how}, --except {})",
             cat.label().cyan(),
-            fmt_size(result.category_total(*cat)),
+            fmt_size(shown),
             cat.slug().dimmed()
         );
     }
@@ -137,10 +158,7 @@ pub fn delete_safe(
     for (cat, clean) in &cats {
         println!("\n  {}", cat.label().cyan().bold());
         for d in &result.dirs_by_category(*cat) {
-            total_freed += match clean {
-                Clean::Remove => remove_reporting(d, home, "    "),
-                Clean::Prune(pruner) => prune_reporting(d, *pruner, home, "    "),
-            };
+            total_freed += clean_reporting(d, *clean, &sessions, home, "    ");
         }
     }
 
@@ -151,6 +169,7 @@ pub fn delete_safe(
 
 pub fn interactive_delete(result: &ScanResult, home: &Path) {
     let mut total_freed = 0u64;
+    let sessions = Sessions::load(home);
 
     for cat in all_categories() {
         let dirs = result.dirs_by_category(cat);
@@ -161,9 +180,9 @@ pub fn interactive_delete(result: &ScanResult, home: &Path) {
         let cat_total: u64 = dirs.iter().map(|d| d.size).sum();
         let sweep = cat.sweep();
         let badge = match sweep {
-            Sweep::Clean(Clean::Remove) => " [safe to delete]".green().to_string(),
+            Sweep::Clean(Clean::Remove(_)) => " [safe to delete]".green().to_string(),
             Sweep::Clean(Clean::Prune(_)) => " [pruned by --delete-safe]".green().to_string(),
-            Sweep::Review => " [review carefully]".yellow().to_string(),
+            Sweep::Review(_) => " [review carefully]".yellow().to_string(),
         };
 
         println!(
@@ -178,43 +197,103 @@ pub fn interactive_delete(result: &ScanResult, home: &Path) {
         if dirs.len() > 5 {
             println!("    ... and {} more", dirs.len() - 5);
         }
-        if cat.delete_contents_only() {
-            println!(
-                "    {}",
-                "(contents are cleared; the directory itself stays)".dimmed()
-            );
+        let note = match cat.removal() {
+            Removal::Whole => None,
+            Removal::Contents => Some("(contents are cleared; the directory itself stays)"),
+            Removal::KeepingPackages => Some("(downloaded Swift packages are kept)"),
+        };
+        if let Some(note) = note {
+            println!("    {}", note.dimmed());
         }
 
         let clean = match sweep {
             Sweep::Clean(Clean::Prune(pruner)) => {
                 match ask("  Prune unused entries, delete all of it, or skip? [p/d/N] ").as_str() {
                     "p" => Clean::Prune(pruner),
-                    "d" => Clean::Remove,
+                    "d" => Clean::Remove(Guard::Always),
                     _ => {
                         println!("  Skipped.");
                         continue;
                     }
                 }
             }
-            Sweep::Clean(Clean::Remove) | Sweep::Review => {
+            Sweep::Clean(Clean::Remove(guard)) | Sweep::Review(guard) => {
                 if !confirm("  Delete this category? [y/N] ") {
                     println!("  Skipped.");
                     continue;
                 }
-                Clean::Remove
+                Clean::Remove(guard)
             }
         };
 
         for d in &dirs {
-            total_freed += match clean {
-                Clean::Remove => remove_reporting(d, home, "    "),
-                Clean::Prune(pruner) => prune_reporting(d, pruner, home, "    "),
-            };
+            total_freed += clean_reporting(d, clean, &sessions, home, "    ");
         }
     }
 
     println!();
     println!("  Total freed: {}", fmt_size(total_freed).bold().green());
+}
+
+/// Cleans one directory if its guard still allows it, prints the outcome, and
+/// returns the bytes reclaimed.
+fn clean_reporting(
+    dir: &FoundDir,
+    clean: Clean,
+    sessions: &Sessions,
+    home: &Path,
+    indent: &str,
+) -> u64 {
+    if let Err(reason) = allowed(clean, dir, sessions) {
+        println!(
+            "{indent}{} {}: {reason}",
+            "kept".yellow(),
+            display_path(&dir.path, home).dimmed()
+        );
+        return 0;
+    }
+    match clean {
+        Clean::Remove(_) => remove_reporting(dir, home, indent),
+        Clean::Prune(pruner) => prune_reporting(dir, pruner, home, indent),
+    }
+}
+
+fn allowed(clean: Clean, dir: &FoundDir, sessions: &Sessions) -> Result<(), String> {
+    match clean {
+        Clean::Remove(Guard::Always) | Clean::Prune(_) => Ok(()),
+        Clean::Remove(Guard::SessionEnded) => {
+            if sessions.may_be_running(&dir.path) {
+                return Err("a Claude Code session may still be using it".to_owned());
+            }
+            idle(dir)
+        }
+    }
+}
+
+fn idle(dir: &FoundDir) -> Result<(), String> {
+    // A modification time in the future reads as just written.
+    let age = SystemTime::now()
+        .duration_since(dir.last_modified)
+        .unwrap_or_default();
+    if age >= IDLE_BEFORE_DELETE {
+        Ok(())
+    } else {
+        Err(format!(
+            "written {} minutes ago, may still be in use",
+            age.as_secs() / 60
+        ))
+    }
+}
+
+/// Claude Code's temp folders strictly inside `path`, which nothing but their
+/// own entries may delete.
+fn claude_dirs_inside(path: &Path) -> Vec<PathBuf> {
+    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(claude_code::temp_dirs)
+        .iter()
+        .filter(|dir| dir.starts_with(path) && dir.as_path() != path)
+        .cloned()
+        .collect()
 }
 
 /// Prunes one cache through its owning tool, prints the outcome, and returns
@@ -245,14 +324,14 @@ fn prune(dir: &FoundDir, pruner: Pruner) -> (u64, Option<String>) {
             let mut c = Command::new("uv");
             c.args(["cache", "prune", "--cache-dir"])
                 .arg(&dir.path)
-                .env("UV_LOCK_TIMEOUT", PRUNE_LOCK_TIMEOUT_SECS);
+                .env("UV_LOCK_TIMEOUT", PRUNE_LOCK_TIMEOUT.as_secs().to_string());
             c
         }
     };
     let outcome = run_quietly(&mut command, pruner);
 
     let remaining = if dir.path.exists() {
-        dir_stats(&dir.path).0
+        dir_stats(&dir.path, &[]).0
     } else {
         0
     };
@@ -284,8 +363,13 @@ fn run_quietly(command: &mut Command, pruner: Pruner) -> Result<(), String> {
 
 /// Deletes one directory, prints the outcome, and returns the bytes reclaimed.
 fn remove_reporting(dir: &FoundDir, home: &Path, indent: &str) -> u64 {
-    let (freed, error) = remove(dir);
     let shown = display_path(&dir.path, home);
+    // Deleting a Claude Code session folder takes the build output inside it.
+    if fs::symlink_metadata(&dir.path).is_err() {
+        println!("{indent}{} {}", "gone".dimmed(), shown.dimmed());
+        return 0;
+    }
+    let (freed, error) = remove(dir);
 
     match error {
         None => println!("{indent}{} {}", "deleted".red(), shown.dimmed()),
@@ -305,16 +389,26 @@ fn remove_reporting(dir: &FoundDir, home: &Path, indent: &str) -> u64 {
 /// on Windows: measure what is actually left rather than trusting the size the
 /// scan recorded.
 fn remove(dir: &FoundDir) -> (u64, Option<String>) {
+    let removal = dir.category.removal();
+    let mut keep = claude_dirs_inside(&dir.path);
+    match removal {
+        Removal::KeepingPackages => keep.extend(derived_data_packages(&dir.path)),
+        Removal::Whole | Removal::Contents => {}
+    }
+
     let outcome = if dir.path.is_file() {
         fs::remove_file(&dir.path).map_err(|e| e.to_string())
-    } else if dir.category.delete_contents_only() {
-        clear_contents(&dir.path)
     } else {
-        force_remove_dir_all(&dir.path)
+        match removal {
+            Removal::Whole if keep.is_empty() => force_remove_dir_all(&dir.path),
+            Removal::Whole | Removal::Contents | Removal::KeepingPackages => {
+                clear_contents(&dir.path, &keep)
+            }
+        }
     };
 
     let remaining = if dir.path.exists() {
-        dir_stats(&dir.path).0
+        dir_stats(&dir.path, &keep).0
     } else {
         0
     };
@@ -323,13 +417,23 @@ fn remove(dir: &FoundDir) -> (u64, Option<String>) {
 }
 
 /// Empties a directory but keeps it: the OS and running apps expect paths like
-/// %TEMP% and the browser cache roots to exist.
-fn clear_contents(path: &Path) -> Result<(), String> {
+/// %TEMP% and the browser cache roots to exist. Everything in `keep` survives,
+/// and only the folders leading down to it.
+fn clear_contents(path: &Path, keep: &[PathBuf]) -> Result<(), String> {
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut in_use = 0usize;
 
     for entry in entries.flatten() {
         let child = entry.path();
+        if keep.contains(&child) {
+            continue;
+        }
+        if keep.iter().any(|kept| kept.starts_with(&child)) {
+            if clear_contents(&child, keep).is_err() {
+                in_use += 1;
+            }
+            continue;
+        }
         let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
             force_remove_dir_all(&child)
         } else {
@@ -521,6 +625,52 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(freed, 1_024);
         assert!(!cache.exists());
+    }
+
+    // Rebuilding and reindexing are local; the packages need the network.
+    #[test]
+    fn a_derived_data_root_keeps_every_project_s_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Xcode");
+        let project = root.join("App-abc");
+        for sub in [
+            "Build/Products",
+            "Index.noindex",
+            "SourcePackages/checkouts",
+        ] {
+            fs::create_dir_all(project.join(sub)).unwrap();
+        }
+        fs::write(project.join("Build/Products/App"), vec![0u8; 8_192]).unwrap();
+        fs::write(
+            project.join("SourcePackages/checkouts/pkg"),
+            vec![0u8; 4_096],
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("ModuleCache.noindex")).unwrap();
+        let found = |size| FoundDir {
+            path: root.clone(),
+            category: Category::XcodeDerivedData,
+            size,
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+        };
+
+        let (_, error) = remove(&found(8_192));
+        assert_eq!(error, None);
+
+        let left: Vec<_> = fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec!["SourcePackages"]);
+        assert!(project.join("SourcePackages/checkouts/pkg").is_file());
+        assert!(!root.join("ModuleCache.noindex").exists());
+
+        // The trimmed project no longer looks like DerivedData; a second pass
+        // must still leave its packages alone.
+        let (_, error) = remove(&found(0));
+        assert_eq!(error, None);
+        assert!(project.join("SourcePackages/checkouts/pkg").is_file());
     }
 
     // A contents-only category keeps the directory the OS expects to exist.

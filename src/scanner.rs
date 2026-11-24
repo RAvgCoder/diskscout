@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::claude_code;
 use crate::platform;
 
 struct FileLimits {
@@ -18,25 +19,45 @@ struct FileLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sweep {
     Clean(Clean),
-    Review,
+    /// Deleted only through --delete, and only where the guard allows.
+    Review(Guard),
 }
 
 impl Sweep {
     /// The report's note beside the category; review-carefully ones carry none.
     pub fn tag(self) -> Option<&'static str> {
         match self {
-            Sweep::Clean(Clean::Remove) => Some("safe to delete"),
+            Sweep::Clean(Clean::Remove(_)) => Some("safe to delete"),
             Sweep::Clean(Clean::Prune(_)) => Some("pruned by --delete-safe"),
-            Sweep::Review => None,
+            Sweep::Review(_) => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clean {
-    Remove,
+    Remove(Guard),
     /// Only entries nothing references go, through the owning tool.
     Prune(Pruner),
+}
+
+/// What must still hold when a directory is about to go, checked then rather
+/// than at scan time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard {
+    Always,
+    /// No running Claude Code session owns it, and nothing in it was written
+    /// recently.
+    SessionEnded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    Whole,
+    /// The OS or a running app expects the folder itself to keep existing.
+    Contents,
+    /// Everything except the downloaded Swift packages inside.
+    KeepingPackages,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +88,11 @@ pub enum Category {
     DotNetBuild,
     VisualStudioCache,
     GradleBuild,
+    // What a Claude Code session leaves in its temp folder besides build output.
+    ClaudeTemp,
     // macOS system directories.
     XcodeDerivedData,
+    SwiftPackages,
     XcTestDevices,
     IosSimulators,
     SimulatorRuntimes,
@@ -125,7 +149,9 @@ impl Category {
             Category::DotNetBuild => ".NET bin/ + obj/",
             Category::VisualStudioCache => "Visual Studio .vs/",
             Category::GradleBuild => "Gradle build/",
+            Category::ClaudeTemp => "Claude Code temp",
             Category::XcodeDerivedData => "Xcode DerivedData",
+            Category::SwiftPackages => "Swift package checkouts",
             Category::XcTestDevices => "XCTest simulator clones",
             Category::IosSimulators => "iOS Simulators",
             Category::SimulatorRuntimes => "Simulator runtimes",
@@ -169,6 +195,7 @@ impl Category {
     pub fn sweep(self) -> Sweep {
         match self {
             Category::RustTarget
+            | Category::XcodeDerivedData
             | Category::NodeModules
             | Category::PythonBytecode
             | Category::SwiftPmBuild
@@ -197,14 +224,16 @@ impl Category {
             | Category::GradleCache
             | Category::MavenCache
             | Category::GoModCache
-            | Category::IdeCache => Sweep::Clean(Clean::Remove),
+            | Category::IdeCache => Sweep::Clean(Clean::Remove(Guard::Always)),
             Category::UvCache => Sweep::Clean(Clean::Prune(Pruner::Uv)),
+            Category::ClaudeTemp => Sweep::Review(Guard::SessionEnded),
+            // Only the network brings these back.
+            Category::SwiftPackages => Sweep::Review(Guard::Always),
             Category::PythonEnv
             | Category::NextJs
             | Category::Nuxt
             | Category::SvelteKit
             | Category::CocoaPods
-            | Category::XcodeDerivedData
             | Category::IosSimulators
             | Category::SimulatorRuntimes
             | Category::IphoneBackups
@@ -215,7 +244,7 @@ impl Category {
             | Category::InstallerCache
             | Category::DockerData
             | Category::AndroidSdk
-            | Category::AndroidEmulator => Sweep::Review,
+            | Category::AndroidEmulator => Sweep::Review(Guard::Always),
         }
     }
 
@@ -233,22 +262,60 @@ impl Category {
         out.trim_matches('-').to_string()
     }
 
-    /// Live directories the OS and running apps expect to keep existing: empty
-    /// them instead of removing the folder itself.
-    pub fn delete_contents_only(self) -> bool {
-        matches!(
-            self,
+    /// How a folder in this category is taken away.
+    pub fn removal(self) -> Removal {
+        match self {
             Category::WindowsTemp
-                | Category::WindowsUpdate
-                | Category::RecycleBin
-                | Category::CrashDumps
-                | Category::WindowsCaches
-                | Category::ThumbnailCache
-                | Category::BrowserCache
-                | Category::AppWebCache
-                | Category::ContainerCaches
-                | Category::ExpensiveCache
-        )
+            | Category::WindowsUpdate
+            | Category::RecycleBin
+            | Category::CrashDumps
+            | Category::WindowsCaches
+            | Category::ThumbnailCache
+            | Category::BrowserCache
+            | Category::AppWebCache
+            | Category::ContainerCaches
+            | Category::ExpensiveCache => Removal::Contents,
+            Category::XcodeDerivedData => Removal::KeepingPackages,
+            Category::RustTarget
+            | Category::NodeModules
+            | Category::PythonBytecode
+            | Category::PythonEnv
+            | Category::NextJs
+            | Category::Nuxt
+            | Category::SvelteKit
+            | Category::CocoaPods
+            | Category::SwiftPmBuild
+            | Category::DotNetBuild
+            | Category::VisualStudioCache
+            | Category::GradleBuild
+            | Category::ClaudeTemp
+            | Category::SwiftPackages
+            | Category::XcTestDevices
+            | Category::IosSimulators
+            | Category::SimulatorRuntimes
+            | Category::XcodeDeviceSupport
+            | Category::XcodeCaches
+            | Category::InstrumentsTraces
+            | Category::MacOsCaches
+            | Category::IphoneBackups
+            | Category::CloudMirror
+            | Category::WindowsOld
+            | Category::InstallerCache
+            | Category::NpmCache
+            | Category::YarnPnpmCache
+            | Category::HomebrewCache
+            | Category::UvCache
+            | Category::PipCache
+            | Category::NugetCache
+            | Category::CargoRegistry
+            | Category::GradleCache
+            | Category::MavenCache
+            | Category::GoModCache
+            | Category::IdeCache
+            | Category::DockerData
+            | Category::AndroidSdk
+            | Category::AndroidEmulator => Removal::Whole,
+        }
     }
 }
 
@@ -338,7 +405,7 @@ impl Scanner {
 
     pub fn scan(&self) -> ScanResult {
         let err_count = AtomicUsize::new(0);
-        let mut pending: Vec<(PathBuf, Category)> = Vec::new();
+        let mut hits: Vec<(PathBuf, Category)> = Vec::new();
         let mut large_files: Vec<FoundFile> = Vec::new();
         let mut old_files: Vec<FoundFile> = Vec::new();
         let mut disk_images: Vec<FoundFile> = Vec::new();
@@ -358,15 +425,40 @@ impl Scanner {
             Vec::new()
         };
 
-        // The default skips keep the walk out of places nobody asked about, so
-        // one that contains the requested root would prune the scan before it
-        // started: naming --path /Volumes/disk is a request, not a suggestion.
-        let mut skip = platform::skip_paths(&self.config.home);
-        skip.retain(|path| !self.config.root.starts_with(path));
+        let (claude_dirs, temp_roots) = if self.config.include_system {
+            let claude_dirs = claude_code::temp_dirs();
+            let mut temp_roots = platform::temp_roots();
+            for dir in &claude_dirs {
+                if !temp_roots.iter().any(|root| dir.starts_with(root)) {
+                    temp_roots.push(dir.clone());
+                }
+            }
+            (claude_dirs, temp_roots)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
-        // The fixed targets are sized directly, so the walker skips them even
-        // then: it avoids both double-counting and a long crawl through caches.
-        skip.extend(system.iter().map(|(path, _)| path.clone()));
+        let fixed: Vec<PathBuf> = system.iter().map(|(path, _)| path.clone()).collect();
+        let base_skip = platform::skip_paths(&self.config.home);
+        let walks: Vec<(PathBuf, Vec<PathBuf>)> = std::iter::once(&self.config.root)
+            .chain(&temp_roots)
+            .map(|root| {
+                // The fixed targets are sized directly and each temp root is
+                // walked on its own, so the walker skips both. A skip that
+                // contains the root would prune the walk before it started:
+                // naming --path /Volumes/disk is a request, not a suggestion.
+                let mut skip: Vec<PathBuf> = base_skip
+                    .iter()
+                    .chain(&fixed)
+                    .chain(&temp_roots)
+                    .filter(|path| !root.starts_with(path))
+                    .cloned()
+                    .collect();
+                skip.sort();
+                skip.dedup();
+                (root.clone(), skip)
+            })
+            .collect();
 
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
@@ -377,61 +469,75 @@ impl Scanner {
         spinner.set_message("Scanning filesystem...");
         spinner.enable_steady_tick(Duration::from_millis(80));
 
-        let mut walker = WalkDir::new(&self.config.root)
-            .follow_links(false)
-            .into_iter();
+        for (root, skip) in &walks {
+            let mut walker = WalkDir::new(root).follow_links(false).into_iter();
+            loop {
+                let entry = match walker.next() {
+                    None => break,
+                    Some(Err(_)) => {
+                        err_count.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Some(Ok(e)) => e,
+                };
 
-        loop {
-            let entry = match walker.next() {
-                None => break,
-                Some(Err(_)) => {
-                    err_count.fetch_add(1, Ordering::Relaxed);
+                let path = entry.path();
+
+                if skip.iter().any(|s| path.starts_with(s)) {
+                    walker.skip_current_dir();
                     continue;
                 }
-                Some(Ok(e)) => e,
-            };
 
-            let path = entry.path();
+                if entry.file_type().is_dir()
+                    && entry.file_name().to_str() == Some(".git")
+                    && entry.depth() > 0
+                {
+                    walker.skip_current_dir();
+                    continue;
+                }
 
-            if skip.iter().any(|s| path.starts_with(s)) {
-                walker.skip_current_dir();
-                continue;
-            }
+                if entry.file_type().is_dir()
+                    && entry.depth() > 0
+                    && let Some(cat) = classify_dir(&entry)
+                {
+                    hits.push((path.to_owned(), cat));
+                    walker.skip_current_dir();
+                    continue;
+                }
 
-            if entry.file_type().is_dir()
-                && entry.file_name().to_str() == Some(".git")
-                && entry.depth() > 0
-            {
-                walker.skip_current_dir();
-                continue;
-            }
-
-            if entry.file_type().is_dir()
-                && entry.depth() > 0
-                && let Some(cat) = classify_dir(&entry)
-            {
-                pending.push((path.to_owned(), cat));
-                walker.skip_current_dir();
-                continue;
-            }
-
-            if entry.file_type().is_file() {
-                self.check_file(
-                    &entry,
-                    &limits,
-                    &mut large_files,
-                    &mut old_files,
-                    &mut disk_images,
-                );
+                if entry.file_type().is_file() {
+                    self.check_file(
+                        &entry,
+                        &limits,
+                        &mut large_files,
+                        &mut old_files,
+                        &mut disk_images,
+                    );
+                }
             }
         }
 
         spinner.finish_and_clear();
 
+        let mut pending = hits;
         pending.extend(system);
         pending.extend(platform::build_cache_targets(&self.config.home));
 
-        let pending = keep_outermost(pending);
+        let mut pending = keep_outermost(pending, &claude_dirs);
+
+        // Reported on their own so a DerivedData entry is only what deleting it
+        // frees.
+        let packages: Vec<PathBuf> = pending
+            .iter()
+            .filter(|(_, category)| category.removal() == Removal::KeepingPackages)
+            .flat_map(|(path, _)| derived_data_packages(path))
+            .collect();
+        pending.extend(
+            packages
+                .iter()
+                .map(|path| (path.clone(), Category::SwiftPackages)),
+        );
+        let carved_out: Vec<&PathBuf> = claude_dirs.iter().chain(&packages).collect();
 
         eprintln!("Found {} directories -- computing sizes...", pending.len());
 
@@ -445,7 +551,12 @@ impl Scanner {
         let mut dirs: Vec<FoundDir> = pending
             .into_par_iter()
             .map(|(path, category)| {
-                let (size, last_modified) = dir_stats(&path);
+                let carved: Vec<PathBuf> = carved_out
+                    .iter()
+                    .filter(|dir| dir.starts_with(&path) && ***dir != path)
+                    .map(|dir| (*dir).clone())
+                    .collect();
+                let (size, last_modified) = dir_stats(&path, &carved);
                 pb.inc(1);
                 FoundDir {
                     path,
@@ -457,6 +568,9 @@ impl Scanner {
             .collect();
 
         pb.finish_and_clear();
+
+        let sessions = claude_sessions(&claude_dirs, &dirs);
+        dirs.extend(sessions);
 
         // An empty target is either genuinely empty or unreadable without
         // elevation; either way there is nothing to report.
@@ -473,7 +587,7 @@ impl Scanner {
 
         disk_images.sort_by_key(|f| Reverse(f.size));
 
-        let large_unknown_dirs = self.scan_unknown_large_dirs(&dirs, &skip);
+        let large_unknown_dirs = self.scan_unknown_large_dirs(&dirs, &walks);
 
         ScanResult {
             dirs,
@@ -489,7 +603,11 @@ impl Scanner {
     // Second pass: walk to depth 4 looking for large dirs not covered by any
     // known category. Surfaces things like VM images, model weights, forgotten
     // project archives -- anything the pattern matcher wouldn't catch.
-    fn scan_unknown_large_dirs(&self, categorized: &[FoundDir], skip: &[PathBuf]) -> Vec<LargeDir> {
+    fn scan_unknown_large_dirs(
+        &self,
+        categorized: &[FoundDir],
+        walks: &[(PathBuf, Vec<PathBuf>)],
+    ) -> Vec<LargeDir> {
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -500,41 +618,43 @@ impl Scanner {
         spinner.enable_steady_tick(Duration::from_millis(80));
 
         let mut candidates: Vec<PathBuf> = Vec::new();
-        let mut walker = WalkDir::new(&self.config.root)
-            .follow_links(false)
-            .max_depth(4)
-            .into_iter();
+        for (root, skip) in walks {
+            let mut walker = WalkDir::new(root)
+                .follow_links(false)
+                .max_depth(4)
+                .into_iter();
 
-        loop {
-            let entry = match walker.next() {
-                None => break,
-                Some(Err(_)) => continue,
-                Some(Ok(e)) => e,
-            };
+            loop {
+                let entry = match walker.next() {
+                    None => break,
+                    Some(Err(_)) => continue,
+                    Some(Ok(e)) => e,
+                };
 
-            let path = entry.path();
+                let path = entry.path();
 
-            if skip.iter().any(|s| path.starts_with(s)) {
-                walker.skip_current_dir();
-                continue;
+                if skip.iter().any(|s| path.starts_with(s)) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+
+                if !entry.file_type().is_dir() || entry.depth() == 0 {
+                    continue;
+                }
+
+                if entry.file_name().to_str() == Some(".git") {
+                    walker.skip_current_dir();
+                    continue;
+                }
+
+                // Already accounted for in the main categorized report.
+                if categorized.iter().any(|c| path.starts_with(&c.path)) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+
+                candidates.push(path.to_owned());
             }
-
-            if !entry.file_type().is_dir() || entry.depth() == 0 {
-                continue;
-            }
-
-            if entry.file_name().to_str() == Some(".git") {
-                walker.skip_current_dir();
-                continue;
-            }
-
-            // Already accounted for in the main categorized report.
-            if categorized.iter().any(|c| path.starts_with(&c.path)) {
-                walker.skip_current_dir();
-                continue;
-            }
-
-            candidates.push(path.to_owned());
         }
 
         spinner.finish_and_clear();
@@ -554,7 +674,13 @@ impl Scanner {
         let mut all_stats: Vec<(PathBuf, u64, SystemTime)> = candidates
             .into_par_iter()
             .map(|path| {
-                let (size, last_modified) = dir_stats(&path);
+                // What a category already reports inside it is not unexplored.
+                let reported: Vec<PathBuf> = categorized
+                    .iter()
+                    .filter(|c| c.path.starts_with(&path))
+                    .map(|c| c.path.clone())
+                    .collect();
+                let (size, last_modified) = dir_stats(&path, &reported);
                 pb.inc(1);
                 (path, size, last_modified)
             })
@@ -663,6 +789,18 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
         return None;
     }
 
+    // Cargo writes this at the root of every target directory, whatever it is
+    // called, and nothing else writes it.
+    if entry.path().join(".rustc_info.json").is_file() {
+        return Some(Category::RustTarget);
+    }
+    if is_derived_data(entry.path()) {
+        return Some(Category::XcodeDerivedData);
+    }
+    if name == "SourcePackages" && is_package_checkouts(entry.path()) {
+        return Some(Category::SwiftPackages);
+    }
+
     match name {
         "target" => {
             if parent.join("Cargo.toml").exists() || parent.join("Cargo.lock").exists() {
@@ -744,6 +882,41 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
     }
 }
 
+/// Xcode lays out a DerivedData folder the same way under any name
+/// `-derivedDataPath` gives it, and only Xcode writes `.noindex` folders.
+fn is_derived_data(dir: &Path) -> bool {
+    dir.join("info.plist").is_file()
+        && dir.join("Build").is_dir()
+        && [
+            "ModuleCache.noindex",
+            "Index.noindex",
+            "SDKStatCaches.noindex",
+        ]
+        .iter()
+        .any(|marker| dir.join(marker).is_dir())
+}
+
+fn is_package_checkouts(dir: &Path) -> bool {
+    dir.join("checkouts").is_dir()
+        || dir.join("repositories").is_dir()
+        || dir.join("workspace-state.json").is_file()
+}
+
+/// The downloaded Swift packages in a DerivedData folder, or in each project
+/// folder of a DerivedData root. Found by name, since a trimmed project folder
+/// no longer has the layout that marks it as DerivedData.
+pub fn derived_data_packages(path: &Path) -> Vec<PathBuf> {
+    let children: Vec<PathBuf> = std::fs::read_dir(path).map_or_else(
+        |_| Vec::new(),
+        |entries| entries.flatten().map(|entry| entry.path()).collect(),
+    );
+    std::iter::once(path.to_path_buf())
+        .chain(children)
+        .map(|dir| dir.join("SourcePackages"))
+        .filter(|packages| packages.is_dir())
+        .collect()
+}
+
 // An Electron app ships its dependencies inside its own install directory, so
 // the tree looks exactly like a project's `node_modules` -- but deleting it
 // breaks the installed application rather than freeing a rebuildable cache.
@@ -781,16 +954,63 @@ fn has_sibling_ext(dir: &Path, exts: &[&str]) -> bool {
     })
 }
 
+/// One entry per Claude Code session folder, sized without the build output
+/// already reported inside it, but dated by the newest write anywhere in it.
+fn claude_sessions(claude_dirs: &[PathBuf], found: &[FoundDir]) -> Vec<FoundDir> {
+    let entries: Vec<PathBuf> = claude_dirs
+        .iter()
+        .flat_map(|dir| claude_code::temp_entries(dir))
+        .collect();
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    eprintln!("Sizing {} Claude Code temp folders...", entries.len());
+
+    entries
+        .into_par_iter()
+        .map(|entry| {
+            let inside: Vec<&FoundDir> = found
+                .iter()
+                .filter(|dir| dir.path.starts_with(&entry))
+                .collect();
+            let excluded: Vec<PathBuf> = inside.iter().map(|dir| dir.path.clone()).collect();
+            let (size, own_newest) = dir_stats(&entry, &excluded);
+            let last_modified = inside
+                .iter()
+                .map(|dir| dir.last_modified)
+                .fold(own_newest, SystemTime::max);
+            FoundDir {
+                path: entry,
+                category: Category::ClaudeTemp,
+                size,
+                last_modified,
+            }
+        })
+        .collect()
+}
+
 /// Two targets can name the same directory (%TEMP% under a relocated profile),
 /// and one can sit inside another (a sandboxed app's cache inside its own
 /// container). Sizing either twice inflates the total, so only the outermost of
 /// an overlap survives. Path order puts an ancestor ahead of everything under it.
-fn keep_outermost(mut targets: Vec<(PathBuf, Category)>) -> Vec<(PathBuf, Category)> {
+fn keep_outermost(
+    mut targets: Vec<(PathBuf, Category)>,
+    carved: &[PathBuf],
+) -> Vec<(PathBuf, Category)> {
     targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // A carved-out folder is reported on its own, so what lies inside it stays
+    // separate from a target around it.
+    let covers = |outer: &Path, path: &Path| {
+        path.starts_with(outer)
+            && !carved.iter().any(|cut| {
+                cut.as_path() != outer && cut.starts_with(outer) && path.starts_with(cut)
+            })
+    };
 
     let mut kept: Vec<(PathBuf, Category)> = Vec::with_capacity(targets.len());
     for (path, category) in targets {
-        if !kept.iter().any(|(outer, _)| path.starts_with(outer)) {
+        if !kept.iter().any(|(outer, _)| covers(outer, &path)) {
             kept.push((path, category));
         }
     }
@@ -800,13 +1020,14 @@ fn keep_outermost(mut targets: Vec<(PathBuf, Category)>) -> Vec<(PathBuf, Catego
 // Computes total size and most-recent modification time in a single walk.
 // Hard links are counted once per walk, so a blob linked from two targets is
 // still counted twice; nothing observed links across targets.
-pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
+pub fn dir_stats(path: &Path, excluded: &[PathBuf]) -> (u64, SystemTime) {
     let mut size = 0u64;
     let mut newest = SystemTime::UNIX_EPOCH;
     let mut linked = HashSet::new();
     for entry in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| !excluded.iter().any(|cut| entry.path() == cut))
         .filter_map(std::result::Result::ok)
     {
         if entry.file_type().is_file()
@@ -817,7 +1038,9 @@ pub fn dir_stats(path: &Path) -> (u64, SystemTime) {
                 continue;
             }
             size += platform::size_on_disk(entry.path(), &meta);
-            if let Ok(modified) = meta.modified()
+            // Finder rewrites it whenever the folder is viewed, so it dates nothing.
+            if entry.file_name() != ".DS_Store"
+                && let Ok(modified) = meta.modified()
                 && modified > newest
             {
                 newest = modified;
@@ -1075,12 +1298,15 @@ mod tests {
         let inner = container.join("Library/Caches");
         let sibling = PathBuf::from("/Users/x/Library/Containers/com.other.app/Data");
 
-        let kept = keep_outermost(vec![
-            (inner.clone(), Category::ContainerCaches),
-            (container.clone(), Category::DockerData),
-            (sibling.clone(), Category::ContainerCaches),
-            (container.clone(), Category::DockerData),
-        ]);
+        let kept = keep_outermost(
+            vec![
+                (inner.clone(), Category::ContainerCaches),
+                (container.clone(), Category::DockerData),
+                (sibling.clone(), Category::ContainerCaches),
+                (container.clone(), Category::DockerData),
+            ],
+            &[],
+        );
 
         let paths: Vec<&PathBuf> = kept.iter().map(|(p, _)| p).collect();
         assert_eq!(paths, vec![&container, &sibling], "{kept:?}");
@@ -1092,12 +1318,146 @@ mod tests {
         let dir = PathBuf::from("/a/b");
         let lookalike = PathBuf::from("/a/b-backup");
 
-        let kept = keep_outermost(vec![
-            (lookalike.clone(), Category::MacOsCaches),
-            (dir.clone(), Category::MacOsCaches),
-        ]);
+        let kept = keep_outermost(
+            vec![
+                (lookalike.clone(), Category::MacOsCaches),
+                (dir.clone(), Category::MacOsCaches),
+            ],
+            &[],
+        );
 
         assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    // Windows clears %TEMP% as one target, but Claude Code's folder inside it
+    // is reported on its own, build output included.
+    #[test]
+    fn a_carved_out_folder_keeps_its_own_targets() {
+        let temp = PathBuf::from("/u/AppData/Local/Temp");
+        let claude = temp.join("claude-0");
+        let build = claude.join("-p/0a1368bf-d980-45f6-9293-1e5f06f47f14/scratchpad/dd");
+        let nested = build.join("Build");
+
+        let kept = keep_outermost(
+            vec![
+                (temp.clone(), Category::WindowsTemp),
+                (build.clone(), Category::XcodeDerivedData),
+                (nested.clone(), Category::XcodeDerivedData),
+            ],
+            std::slice::from_ref(&claude),
+        );
+
+        let paths: Vec<&PathBuf> = kept.iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec![&temp, &build], "{kept:?}");
+    }
+
+    // Browsing a scratch build in Finder must not make it look in use.
+    #[test]
+    fn finder_metadata_does_not_date_a_folder() {
+        let td = tempdir().unwrap();
+        let build = td.path().join("out.o");
+        fs::write(&build, vec![1u8; 4_096]).unwrap();
+        let built = SystemTime::now() - Duration::from_secs(3 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&build)
+            .unwrap()
+            .set_modified(built)
+            .unwrap();
+        fs::write(td.path().join(".DS_Store"), vec![1u8; 4_096]).unwrap();
+
+        let (size, newest) = dir_stats(td.path(), &[]);
+
+        assert_eq!(newest, built);
+        assert!(size >= 8_192, "{size}");
+    }
+
+    #[test]
+    fn excluded_subtrees_are_not_sized() {
+        let td = tempdir().unwrap();
+        let kept = td.path().join("notes");
+        let cut = td.path().join("target");
+        fs::create_dir_all(&kept).unwrap();
+        fs::create_dir_all(&cut).unwrap();
+        fs::write(kept.join("a"), vec![1u8; 8_192]).unwrap();
+        fs::write(cut.join("b"), vec![1u8; 65_536]).unwrap();
+
+        let (whole, _) = dir_stats(td.path(), &[]);
+        let (rest, _) = dir_stats(td.path(), std::slice::from_ref(&cut));
+
+        assert_eq!(whole - rest, dir_stats(&cut, &[]).0);
+        assert_eq!(dir_stats(&cut, std::slice::from_ref(&cut)).0, 0);
+    }
+
+    // Agents name these after the run: cargo-target, target-orch, lto-target.
+    #[test]
+    fn a_cargo_target_is_found_under_any_name() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(td.path().join("target-orch/debug")).unwrap();
+        fs::write(td.path().join("target-orch/.rustc_info.json"), "{}").unwrap();
+
+        assert_eq!(
+            classify(td.path(), "target-orch"),
+            Some(Category::RustTarget)
+        );
+    }
+
+    // A trimmed DerivedData folder holds only its packages, which stay review-only.
+    #[test]
+    fn leftover_package_checkouts_are_their_own_category() {
+        let trimmed = tempdir().unwrap();
+        fs::create_dir_all(trimmed.path().join("dd/SourcePackages/repositories")).unwrap();
+        let unrelated = tempdir().unwrap();
+        fs::create_dir_all(unrelated.path().join("notes/SourcePackages")).unwrap();
+
+        assert_eq!(
+            classify(trimmed.path(), "SourcePackages"),
+            Some(Category::SwiftPackages)
+        );
+        assert_eq!(classify(unrelated.path(), "SourcePackages"), None);
+        assert_eq!(
+            Category::SwiftPackages.sweep(),
+            Sweep::Review(Guard::Always)
+        );
+    }
+
+    #[test]
+    fn packages_are_found_in_a_derived_data_folder_and_in_its_projects() {
+        let td = tempdir().unwrap();
+        let single = td.path().join("dd");
+        let root = td.path().join("Xcode");
+        fs::create_dir_all(single.join("SourcePackages")).unwrap();
+        fs::create_dir_all(root.join("App-abc/SourcePackages")).unwrap();
+        fs::create_dir_all(root.join("ModuleCache.noindex")).unwrap();
+
+        assert_eq!(
+            derived_data_packages(&single),
+            vec![single.join("SourcePackages")]
+        );
+        assert_eq!(
+            derived_data_packages(&root),
+            vec![root.join("App-abc/SourcePackages")]
+        );
+    }
+
+    // -derivedDataPath names it anything: dd, dd-sim, release-dd.
+    #[test]
+    fn derived_data_is_found_under_any_name() {
+        let td = tempdir().unwrap();
+        let dd = td.path().join("dd-sim");
+        fs::create_dir_all(dd.join("Build/Intermediates.noindex")).unwrap();
+        fs::create_dir_all(dd.join("ModuleCache.noindex")).unwrap();
+        fs::write(dd.join("info.plist"), "").unwrap();
+        // A project folder with an Info.plist and a Build folder is not one.
+        let app = td.path().join("App");
+        fs::create_dir_all(app.join("Build")).unwrap();
+        fs::write(app.join("Info.plist"), "").unwrap();
+
+        assert_eq!(
+            classify(td.path(), "dd-sim"),
+            Some(Category::XcodeDerivedData)
+        );
+        assert_eq!(classify(td.path(), "App"), None);
     }
 
     #[cfg(not(windows))]
@@ -1108,7 +1468,7 @@ mod tests {
         fs::write(&original, vec![0u8; 8_192]).unwrap();
         fs::hard_link(&original, td.path().join("linked")).unwrap();
 
-        let (size, _) = dir_stats(td.path());
+        let (size, _) = dir_stats(td.path(), &[]);
         assert_eq!(size, 8_192, "the second link is the same allocation");
     }
 
@@ -1124,24 +1484,56 @@ mod tests {
 
     #[test]
     fn only_regenerable_categories_are_marked_safe() {
-        assert_eq!(Category::RustTarget.sweep(), Sweep::Clean(Clean::Remove));
-        assert_eq!(Category::NodeModules.sweep(), Sweep::Clean(Clean::Remove));
-        assert_eq!(Category::WindowsTemp.sweep(), Sweep::Clean(Clean::Remove));
-        assert_eq!(Category::RecycleBin.sweep(), Sweep::Clean(Clean::Remove));
-        assert_eq!(Category::IphoneBackups.sweep(), Sweep::Review);
-        assert_eq!(Category::IosSimulators.sweep(), Sweep::Review);
-        assert_eq!(Category::PythonEnv.sweep(), Sweep::Review);
+        assert_eq!(
+            Category::RustTarget.sweep(),
+            Sweep::Clean(Clean::Remove(Guard::Always))
+        );
+        assert_eq!(
+            Category::NodeModules.sweep(),
+            Sweep::Clean(Clean::Remove(Guard::Always))
+        );
+        // A clean build and a reindex, never data.
+        assert_eq!(
+            Category::XcodeDerivedData.sweep(),
+            Sweep::Clean(Clean::Remove(Guard::Always))
+        );
+        assert_eq!(
+            Category::WindowsTemp.sweep(),
+            Sweep::Clean(Clean::Remove(Guard::Always))
+        );
+        assert_eq!(
+            Category::RecycleBin.sweep(),
+            Sweep::Clean(Clean::Remove(Guard::Always))
+        );
+        assert_eq!(
+            Category::IphoneBackups.sweep(),
+            Sweep::Review(Guard::Always)
+        );
+        assert_eq!(
+            Category::IosSimulators.sweep(),
+            Sweep::Review(Guard::Always)
+        );
+        assert_eq!(Category::PythonEnv.sweep(), Sweep::Review(Guard::Always));
         // Deleting these breaks repair/uninstall or throws away real state.
-        assert_eq!(Category::WindowsOld.sweep(), Sweep::Review);
-        assert_eq!(Category::InstallerCache.sweep(), Sweep::Review);
-        assert_eq!(Category::DockerData.sweep(), Sweep::Review);
+        assert_eq!(Category::WindowsOld.sweep(), Sweep::Review(Guard::Always));
+        assert_eq!(
+            Category::InstallerCache.sweep(),
+            Sweep::Review(Guard::Always)
+        );
+        assert_eq!(Category::DockerData.sweep(), Sweep::Review(Guard::Always));
         // Reported so the space is visible, never auto-deleted: one is real
         // data behind a placeholder, the other needs root and a re-download.
-        assert_eq!(Category::CloudMirror.sweep(), Sweep::Review);
-        assert_eq!(Category::SimulatorRuntimes.sweep(), Sweep::Review);
-        assert_eq!(Category::AndroidEmulator.sweep(), Sweep::Review);
+        assert_eq!(Category::CloudMirror.sweep(), Sweep::Review(Guard::Always));
+        assert_eq!(
+            Category::SimulatorRuntimes.sweep(),
+            Sweep::Review(Guard::Always)
+        );
+        assert_eq!(
+            Category::AndroidEmulator.sweep(),
+            Sweep::Review(Guard::Always)
+        );
         // Nothing personal lives in them, but they are held back on request.
-        assert_eq!(Category::BrowserCache.sweep(), Sweep::Review);
+        assert_eq!(Category::BrowserCache.sweep(), Sweep::Review(Guard::Always));
         // Every uvx run and new virtualenv installs out of it, so clearing it
         // means re-downloading on the next one.
         assert_eq!(
@@ -1216,12 +1608,12 @@ mod tests {
 
     #[test]
     fn live_os_directories_are_emptied_not_removed() {
-        assert!(Category::WindowsTemp.delete_contents_only());
-        assert!(Category::RecycleBin.delete_contents_only());
-        assert!(Category::BrowserCache.delete_contents_only());
+        assert_eq!(Category::WindowsTemp.removal(), Removal::Contents);
+        assert_eq!(Category::RecycleBin.removal(), Removal::Contents);
+        assert_eq!(Category::BrowserCache.removal(), Removal::Contents);
         // Project-local artifacts go away wholesale.
-        assert!(!Category::RustTarget.delete_contents_only());
-        assert!(!Category::NodeModules.delete_contents_only());
+        assert_eq!(Category::RustTarget.removal(), Removal::Whole);
+        assert_eq!(Category::NodeModules.removal(), Removal::Whole);
     }
 
     #[test]
@@ -1230,7 +1622,7 @@ mod tests {
         fs::create_dir_all(td.path().join("a/b")).unwrap();
         fs::write(td.path().join("a/one.bin"), vec![0u8; 100]).unwrap();
         fs::write(td.path().join("a/b/two.bin"), vec![0u8; 250]).unwrap();
-        let (size, newest) = dir_stats(td.path());
+        let (size, newest) = dir_stats(td.path(), &[]);
         assert_eq!(size, 350);
         assert!(newest > SystemTime::UNIX_EPOCH);
     }
@@ -1238,7 +1630,7 @@ mod tests {
     #[test]
     fn dir_stats_on_an_empty_dir_is_zero() {
         let td = tempdir().unwrap();
-        let (size, newest) = dir_stats(td.path());
+        let (size, newest) = dir_stats(td.path(), &[]);
         assert_eq!(size, 0);
         assert_eq!(newest, SystemTime::UNIX_EPOCH);
     }

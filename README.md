@@ -172,28 +172,33 @@ cache directories rather than the top eight.
 
 Deletion is permanent. Not the Trash, no undo.
 
-Thirty-one of the fifty categories are tagged **safe to delete**: regenerable on demand,
-costing a rebuild or a re-download but never data. `--delete-safe` takes exactly these.
+Twenty of the fifty categories are tagged **safe to delete**: everything in them comes back
+without the network, through a rebuild, a reindex, or a copy from a connected device.
+`--delete-safe` takes exactly these. Anything only a download restores is held back, so a
+machine cleaned on the ground still builds in the air: `node_modules`, the npm, yarn, pnpm,
+bun, pip, NuGet, Cargo, Gradle, Maven, Go and Homebrew caches, and Xcode's documentation
+cache.
 
-DerivedData is one of them, but its `SourcePackages` folder is not: deleting the build
-products, index and module caches costs Xcode a clean build and a reindex, both local,
-while the packages would have to come back over the network. What is left still resolves
-offline: with git limited to local files (`GIT_ALLOW_PROTOCOL=file`) and the shared
+DerivedData and SwiftPM's `.build/` are safe, but what they downloaded is not. Deleting
+DerivedData's build products, index and module caches costs Xcode a clean build and a
+reindex, both local, and its `SourcePackages` folder stays; `.build/` keeps its
+`checkouts`, `repositories`, `artifacts` and `workspace-state.json`. The kept packages are
+reported as Swift package checkouts. A trimmed DerivedData still resolves offline: with git limited to local files (`GIT_ALLOW_PROTOCOL=file`) and the shared
 repository cache disabled, `xcodebuild -resolvePackageDependencies` succeeded against a
 kept `SourcePackages` and failed against an empty one.
 
 One, the uv cache, is **pruned by --delete-safe** instead: every `uvx` run and new
 virtualenv installs out of it, so clearing it means re-downloading on the next one.
-`--delete-safe` runs `uv cache prune`, which drops only what nothing references, and reports
+`--delete-safe` runs `uv cache prune`, which drops only what nothing references, so every
+wheel an environment uses stays and nothing has to be downloaded again, and reports
 what that actually freed. If another uv process holds the cache, the prune gives up after
 ten seconds and says so; it never passes `--force`, because prune also removes cached
 environments a running `uvx` tool may be executing from. `--delete` offers the choice of
 pruning it or deleting all of it.
 
-The other eighteen are tagged **review carefully** and `--delete-safe` never touches them,
-whatever `--except` says. Virtualenvs, framework build directories, the Swift packages
-DerivedData downloaded, simulators
-and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
+The other twenty-nine are tagged **review carefully** and `--delete-safe` never touches
+them, whatever `--except` says. The download caches and Swift package checkouts above,
+virtualenvs, framework build directories, simulators and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
 hours to rebuild, `Windows.old`, the installer payload cache still needed to repair or
 uninstall, Docker and WSL data, the Android SDK and emulator images, and Claude Code's
 session folders. They are still measured and still reported, because knowing where the
@@ -332,7 +337,7 @@ Windows is not covered by that gate, so check it explicitly when touching `platf
 
     cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-Seventy-two tests cover directory classification and the marker files it requires, the size
+Seventy-three tests cover directory classification and the marker files it requires, the size
 accounting including the sparse and hard-link cases, category slugs and their uniqueness,
 the deletion policy, and each refusal rule above. The rules that exist because something
 broke are pinned by a test naming the failure, so a future change that reintroduces the bug

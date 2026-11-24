@@ -30,6 +30,7 @@ pub(crate) const SECTION_CATS: &[(&str, &[Category])] = &[
         "MACOS & XCODE",
         &[
             Category::XcodeDerivedData,
+            Category::SwiftPackages,
             Category::XcTestDevices,
             Category::IosSimulators,
             Category::SimulatorRuntimes,
@@ -148,7 +149,7 @@ pub fn print_report(result: &ScanResult, home: &Path) {
                     println!(
                         "      {}",
                         format!(
-                            "plus {} of build output inside, listed under its own categories",
+                            "plus {} inside it, listed under other categories",
                             fmt_size(inside)
                         )
                         .dimmed()

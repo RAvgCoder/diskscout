@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 use crate::claude_code::{self, Sessions};
 use crate::report::all_categories;
 use crate::scanner::{
-    Category, Clean, FoundDir, Guard, Pruner, ScanResult, Sweep, dir_stats, display_path, fmt_size,
+    Category, Clean, FoundDir, Guard, Pruner, Removal, ScanResult, Sweep, derived_data_packages,
+    dir_stats, display_path, fmt_size,
 };
 
 /// How long a pruner may wait on a cache another process holds before giving up.
@@ -196,11 +197,13 @@ pub fn interactive_delete(result: &ScanResult, home: &Path) {
         if dirs.len() > 5 {
             println!("    ... and {} more", dirs.len() - 5);
         }
-        if cat.delete_contents_only() {
-            println!(
-                "    {}",
-                "(contents are cleared; the directory itself stays)".dimmed()
-            );
+        let note = match cat.removal() {
+            Removal::Whole => None,
+            Removal::Contents => Some("(contents are cleared; the directory itself stays)"),
+            Removal::KeepingPackages => Some("(downloaded Swift packages are kept)"),
+        };
+        if let Some(note) = note {
+            println!("    {}", note.dimmed());
         }
 
         let clean = match sweep {
@@ -386,13 +389,22 @@ fn remove_reporting(dir: &FoundDir, home: &Path, indent: &str) -> u64 {
 /// on Windows: measure what is actually left rather than trusting the size the
 /// scan recorded.
 fn remove(dir: &FoundDir) -> (u64, Option<String>) {
-    let keep = claude_dirs_inside(&dir.path);
+    let removal = dir.category.removal();
+    let mut keep = claude_dirs_inside(&dir.path);
+    match removal {
+        Removal::KeepingPackages => keep.extend(derived_data_packages(&dir.path)),
+        Removal::Whole | Removal::Contents => {}
+    }
+
     let outcome = if dir.path.is_file() {
         fs::remove_file(&dir.path).map_err(|e| e.to_string())
-    } else if dir.category.delete_contents_only() || !keep.is_empty() {
-        clear_contents(&dir.path, &keep)
     } else {
-        force_remove_dir_all(&dir.path)
+        match removal {
+            Removal::Whole if keep.is_empty() => force_remove_dir_all(&dir.path),
+            Removal::Whole | Removal::Contents | Removal::KeepingPackages => {
+                clear_contents(&dir.path, &keep)
+            }
+        }
     };
 
     let remaining = if dir.path.exists() {
@@ -405,15 +417,21 @@ fn remove(dir: &FoundDir) -> (u64, Option<String>) {
 }
 
 /// Empties a directory but keeps it: the OS and running apps expect paths like
-/// %TEMP% and the browser cache roots to exist. Children holding anything in
-/// `keep` stay whole.
+/// %TEMP% and the browser cache roots to exist. Everything in `keep` survives,
+/// and only the folders leading down to it.
 fn clear_contents(path: &Path, keep: &[PathBuf]) -> Result<(), String> {
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut in_use = 0usize;
 
     for entry in entries.flatten() {
         let child = entry.path();
+        if keep.contains(&child) {
+            continue;
+        }
         if keep.iter().any(|kept| kept.starts_with(&child)) {
+            if clear_contents(&child, keep).is_err() {
+                in_use += 1;
+            }
             continue;
         }
         let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -607,6 +625,52 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(freed, 1_024);
         assert!(!cache.exists());
+    }
+
+    // Rebuilding and reindexing are local; the packages need the network.
+    #[test]
+    fn a_derived_data_root_keeps_every_project_s_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Xcode");
+        let project = root.join("App-abc");
+        for sub in [
+            "Build/Products",
+            "Index.noindex",
+            "SourcePackages/checkouts",
+        ] {
+            fs::create_dir_all(project.join(sub)).unwrap();
+        }
+        fs::write(project.join("Build/Products/App"), vec![0u8; 8_192]).unwrap();
+        fs::write(
+            project.join("SourcePackages/checkouts/pkg"),
+            vec![0u8; 4_096],
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("ModuleCache.noindex")).unwrap();
+        let found = |size| FoundDir {
+            path: root.clone(),
+            category: Category::XcodeDerivedData,
+            size,
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+        };
+
+        let (_, error) = remove(&found(8_192));
+        assert_eq!(error, None);
+
+        let left: Vec<_> = fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec!["SourcePackages"]);
+        assert!(project.join("SourcePackages/checkouts/pkg").is_file());
+        assert!(!root.join("ModuleCache.noindex").exists());
+
+        // The trimmed project no longer looks like DerivedData; a second pass
+        // must still leave its packages alone.
+        let (_, error) = remove(&found(0));
+        assert_eq!(error, None);
+        assert!(project.join("SourcePackages/checkouts/pkg").is_file());
     }
 
     // A contents-only category keeps the directory the OS expects to exist.

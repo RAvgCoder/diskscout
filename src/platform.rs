@@ -334,6 +334,33 @@ pub fn skip_paths(home: &Path) -> Vec<PathBuf> {
     skip
 }
 
+/// Where Xcode builds: the folder its own setting names, plus the default,
+/// which may still hold builds from before the setting.
+#[cfg(not(windows))]
+fn xcode_derived_data_dirs(home: &Path) -> Vec<PathBuf> {
+    let custom = std::process::Command::new("defaults")
+        .args(["read", "com.apple.dt.Xcode", "IDECustomDerivedDataLocation"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .map(|path| match path.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(path),
+        })
+        .filter(|path| path.is_absolute());
+
+    let mut dirs: Vec<PathBuf> = custom
+        .into_iter()
+        .chain([home.join("Library/Developer/Xcode/DerivedData")])
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
+        .collect();
+    dirs.dedup();
+    dirs
+}
+
 #[cfg(not(windows))]
 pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     let mut out = Vec::new();
@@ -341,14 +368,13 @@ pub fn system_targets(home: &Path) -> Vec<(PathBuf, Category)> {
     let support = home.join("Library/Application Support");
     let containers = home.join("Library/Containers");
 
+    for dir in xcode_derived_data_dirs(home) {
+        if dir.exists() {
+            out.push((dir, Category::XcodeDerivedData));
+        }
+    }
+
     let candidates = [
-        // Resolve symlink so ~/.build_caches/xcode and the DerivedData symlink
-        // don't both end up in the list and get double-counted.
-        (
-            std::fs::canonicalize(home.join("Library/Developer/Xcode/DerivedData"))
-                .unwrap_or_else(|_| home.join("Library/Developer/Xcode/DerivedData")),
-            Category::XcodeDerivedData,
-        ),
         (
             home.join("Library/Developer/XCTestDevices"),
             Category::XcTestDevices,
@@ -1240,7 +1266,7 @@ mod size_tests {
 #[cfg(test)]
 mod target_tests {
     use super::*;
-    use crate::scanner::{Guard, Sweep};
+    use crate::scanner::{Guard, Removal, Sweep};
 
     #[test]
     fn a_web_cache_is_found_at_every_depth_and_never_descended_into() {
@@ -1521,7 +1547,7 @@ mod target_tests {
             Category::ExpensiveCache.sweep(),
             Sweep::Review(Guard::Always)
         );
-        assert!(Category::ExpensiveCache.delete_contents_only());
+        assert_eq!(Category::ExpensiveCache.removal(), Removal::Contents);
     }
 
     // The container that cost a 340 GB re-download, plus the shapes around it:

@@ -52,6 +52,15 @@ pub enum Guard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    Whole,
+    /// The OS or a running app expects the folder itself to keep existing.
+    Contents,
+    /// Everything except the downloaded Swift packages inside.
+    KeepingPackages,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pruner {
     Uv,
 }
@@ -83,6 +92,7 @@ pub enum Category {
     ClaudeTemp,
     // macOS system directories.
     XcodeDerivedData,
+    SwiftPackages,
     XcTestDevices,
     IosSimulators,
     SimulatorRuntimes,
@@ -141,6 +151,7 @@ impl Category {
             Category::GradleBuild => "Gradle build/",
             Category::ClaudeTemp => "Claude Code temp",
             Category::XcodeDerivedData => "Xcode DerivedData",
+            Category::SwiftPackages => "Swift package checkouts",
             Category::XcTestDevices => "XCTest simulator clones",
             Category::IosSimulators => "iOS Simulators",
             Category::SimulatorRuntimes => "Simulator runtimes",
@@ -184,6 +195,7 @@ impl Category {
     pub fn sweep(self) -> Sweep {
         match self {
             Category::RustTarget
+            | Category::XcodeDerivedData
             | Category::NodeModules
             | Category::PythonBytecode
             | Category::SwiftPmBuild
@@ -215,12 +227,13 @@ impl Category {
             | Category::IdeCache => Sweep::Clean(Clean::Remove(Guard::Always)),
             Category::UvCache => Sweep::Clean(Clean::Prune(Pruner::Uv)),
             Category::ClaudeTemp => Sweep::Review(Guard::SessionEnded),
+            // Only the network brings these back.
+            Category::SwiftPackages => Sweep::Review(Guard::Always),
             Category::PythonEnv
             | Category::NextJs
             | Category::Nuxt
             | Category::SvelteKit
             | Category::CocoaPods
-            | Category::XcodeDerivedData
             | Category::IosSimulators
             | Category::SimulatorRuntimes
             | Category::IphoneBackups
@@ -249,22 +262,60 @@ impl Category {
         out.trim_matches('-').to_string()
     }
 
-    /// Live directories the OS and running apps expect to keep existing: empty
-    /// them instead of removing the folder itself.
-    pub fn delete_contents_only(self) -> bool {
-        matches!(
-            self,
+    /// How a folder in this category is taken away.
+    pub fn removal(self) -> Removal {
+        match self {
             Category::WindowsTemp
-                | Category::WindowsUpdate
-                | Category::RecycleBin
-                | Category::CrashDumps
-                | Category::WindowsCaches
-                | Category::ThumbnailCache
-                | Category::BrowserCache
-                | Category::AppWebCache
-                | Category::ContainerCaches
-                | Category::ExpensiveCache
-        )
+            | Category::WindowsUpdate
+            | Category::RecycleBin
+            | Category::CrashDumps
+            | Category::WindowsCaches
+            | Category::ThumbnailCache
+            | Category::BrowserCache
+            | Category::AppWebCache
+            | Category::ContainerCaches
+            | Category::ExpensiveCache => Removal::Contents,
+            Category::XcodeDerivedData => Removal::KeepingPackages,
+            Category::RustTarget
+            | Category::NodeModules
+            | Category::PythonBytecode
+            | Category::PythonEnv
+            | Category::NextJs
+            | Category::Nuxt
+            | Category::SvelteKit
+            | Category::CocoaPods
+            | Category::SwiftPmBuild
+            | Category::DotNetBuild
+            | Category::VisualStudioCache
+            | Category::GradleBuild
+            | Category::ClaudeTemp
+            | Category::SwiftPackages
+            | Category::XcTestDevices
+            | Category::IosSimulators
+            | Category::SimulatorRuntimes
+            | Category::XcodeDeviceSupport
+            | Category::XcodeCaches
+            | Category::InstrumentsTraces
+            | Category::MacOsCaches
+            | Category::IphoneBackups
+            | Category::CloudMirror
+            | Category::WindowsOld
+            | Category::InstallerCache
+            | Category::NpmCache
+            | Category::YarnPnpmCache
+            | Category::HomebrewCache
+            | Category::UvCache
+            | Category::PipCache
+            | Category::NugetCache
+            | Category::CargoRegistry
+            | Category::GradleCache
+            | Category::MavenCache
+            | Category::GoModCache
+            | Category::IdeCache
+            | Category::DockerData
+            | Category::AndroidSdk
+            | Category::AndroidEmulator => Removal::Whole,
+        }
     }
 }
 
@@ -472,7 +523,21 @@ impl Scanner {
         pending.extend(system);
         pending.extend(platform::build_cache_targets(&self.config.home));
 
-        let pending = keep_outermost(pending, &claude_dirs);
+        let mut pending = keep_outermost(pending, &claude_dirs);
+
+        // Reported on their own so a DerivedData entry is only what deleting it
+        // frees.
+        let packages: Vec<PathBuf> = pending
+            .iter()
+            .filter(|(_, category)| category.removal() == Removal::KeepingPackages)
+            .flat_map(|(path, _)| derived_data_packages(path))
+            .collect();
+        pending.extend(
+            packages
+                .iter()
+                .map(|path| (path.clone(), Category::SwiftPackages)),
+        );
+        let carved_out: Vec<&PathBuf> = claude_dirs.iter().chain(&packages).collect();
 
         eprintln!("Found {} directories -- computing sizes...", pending.len());
 
@@ -486,10 +551,10 @@ impl Scanner {
         let mut dirs: Vec<FoundDir> = pending
             .into_par_iter()
             .map(|(path, category)| {
-                let carved: Vec<PathBuf> = claude_dirs
+                let carved: Vec<PathBuf> = carved_out
                     .iter()
-                    .filter(|dir| dir.starts_with(&path) && **dir != path)
-                    .cloned()
+                    .filter(|dir| dir.starts_with(&path) && ***dir != path)
+                    .map(|dir| (*dir).clone())
                     .collect();
                 let (size, last_modified) = dir_stats(&path, &carved);
                 pb.inc(1);
@@ -732,6 +797,9 @@ fn classify_dir(entry: &DirEntry) -> Option<Category> {
     if is_derived_data(entry.path()) {
         return Some(Category::XcodeDerivedData);
     }
+    if name == "SourcePackages" && is_package_checkouts(entry.path()) {
+        return Some(Category::SwiftPackages);
+    }
 
     match name {
         "target" => {
@@ -826,6 +894,27 @@ fn is_derived_data(dir: &Path) -> bool {
         ]
         .iter()
         .any(|marker| dir.join(marker).is_dir())
+}
+
+fn is_package_checkouts(dir: &Path) -> bool {
+    dir.join("checkouts").is_dir()
+        || dir.join("repositories").is_dir()
+        || dir.join("workspace-state.json").is_file()
+}
+
+/// The downloaded Swift packages in a DerivedData folder, or in each project
+/// folder of a DerivedData root. Found by name, since a trimmed project folder
+/// no longer has the layout that marks it as DerivedData.
+pub fn derived_data_packages(path: &Path) -> Vec<PathBuf> {
+    let children: Vec<PathBuf> = std::fs::read_dir(path).map_or_else(
+        |_| Vec::new(),
+        |entries| entries.flatten().map(|entry| entry.path()).collect(),
+    );
+    std::iter::once(path.to_path_buf())
+        .chain(children)
+        .map(|dir| dir.join("SourcePackages"))
+        .filter(|packages| packages.is_dir())
+        .collect()
 }
 
 // An Electron app ships its dependencies inside its own install directory, so
@@ -1313,6 +1402,44 @@ mod tests {
         );
     }
 
+    // A trimmed DerivedData folder holds only its packages, which stay review-only.
+    #[test]
+    fn leftover_package_checkouts_are_their_own_category() {
+        let trimmed = tempdir().unwrap();
+        fs::create_dir_all(trimmed.path().join("dd/SourcePackages/repositories")).unwrap();
+        let unrelated = tempdir().unwrap();
+        fs::create_dir_all(unrelated.path().join("notes/SourcePackages")).unwrap();
+
+        assert_eq!(
+            classify(trimmed.path(), "SourcePackages"),
+            Some(Category::SwiftPackages)
+        );
+        assert_eq!(classify(unrelated.path(), "SourcePackages"), None);
+        assert_eq!(
+            Category::SwiftPackages.sweep(),
+            Sweep::Review(Guard::Always)
+        );
+    }
+
+    #[test]
+    fn packages_are_found_in_a_derived_data_folder_and_in_its_projects() {
+        let td = tempdir().unwrap();
+        let single = td.path().join("dd");
+        let root = td.path().join("Xcode");
+        fs::create_dir_all(single.join("SourcePackages")).unwrap();
+        fs::create_dir_all(root.join("App-abc/SourcePackages")).unwrap();
+        fs::create_dir_all(root.join("ModuleCache.noindex")).unwrap();
+
+        assert_eq!(
+            derived_data_packages(&single),
+            vec![single.join("SourcePackages")]
+        );
+        assert_eq!(
+            derived_data_packages(&root),
+            vec![root.join("App-abc/SourcePackages")]
+        );
+    }
+
     // -derivedDataPath names it anything: dd, dd-sim, release-dd.
     #[test]
     fn derived_data_is_found_under_any_name() {
@@ -1363,6 +1490,11 @@ mod tests {
         );
         assert_eq!(
             Category::NodeModules.sweep(),
+            Sweep::Clean(Clean::Remove(Guard::Always))
+        );
+        // A clean build and a reindex, never data.
+        assert_eq!(
+            Category::XcodeDerivedData.sweep(),
             Sweep::Clean(Clean::Remove(Guard::Always))
         );
         assert_eq!(
@@ -1476,12 +1608,12 @@ mod tests {
 
     #[test]
     fn live_os_directories_are_emptied_not_removed() {
-        assert!(Category::WindowsTemp.delete_contents_only());
-        assert!(Category::RecycleBin.delete_contents_only());
-        assert!(Category::BrowserCache.delete_contents_only());
+        assert_eq!(Category::WindowsTemp.removal(), Removal::Contents);
+        assert_eq!(Category::RecycleBin.removal(), Removal::Contents);
+        assert_eq!(Category::BrowserCache.removal(), Removal::Contents);
         // Project-local artifacts go away wholesale.
-        assert!(!Category::RustTarget.delete_contents_only());
-        assert!(!Category::NodeModules.delete_contents_only());
+        assert_eq!(Category::RustTarget.removal(), Removal::Whole);
+        assert_eq!(Category::NodeModules.removal(), Removal::Whole);
     }
 
     #[test]

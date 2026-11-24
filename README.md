@@ -106,7 +106,7 @@ silently ignored, because a typo would otherwise delete the thing you meant to k
 
 ## What it finds
 
-Forty-nine categories in seven sections. A section whose categories are all empty is not
+Fifty categories in seven sections. A section whose categories are all empty is not
 printed, so each machine sees only what applies to it.
 
 **Build artifacts** are found by walking, and a directory only counts when the marker that
@@ -126,8 +126,10 @@ under `$CLAUDE_CODE_TMPDIR` wherever that is set. What is left of each session f
 its build output is counted is its own category, one entry per session, with the build
 output inside given as a separate figure and a session still running marked.
 
-**macOS and Xcode** covers DerivedData wherever it lives, recognised by its layout so a
-`-derivedDataPath` folder counts under any name, XCTest simulator clones, the
+**macOS and Xcode** covers DerivedData wherever it lives: the folder Xcode's own
+DerivedData setting names, the default under `~/Library`, and any `-derivedDataPath`
+folder, recognised by its layout under any name, with the Swift packages each one
+downloaded reported apart from it; XCTest simulator clones, the
 simulators and their runtimes, per-OS device support, the documentation cache, Instruments
 recordings, `~/Library/Caches` broken out one entry per app, and iPhone backups.
 
@@ -170,9 +172,15 @@ cache directories rather than the top eight.
 
 Deletion is permanent. Not the Trash, no undo.
 
-Thirty of the forty-nine categories are tagged **safe to delete**: regenerable on
-demand, costing a rebuild or a re-download but never data. `--delete-safe` takes exactly
-these.
+Thirty-one of the fifty categories are tagged **safe to delete**: regenerable on demand,
+costing a rebuild or a re-download but never data. `--delete-safe` takes exactly these.
+
+DerivedData is one of them, but its `SourcePackages` folder is not: deleting the build
+products, index and module caches costs Xcode a clean build and a reindex, both local,
+while the packages would have to come back over the network. What is left still resolves
+offline: with git limited to local files (`GIT_ALLOW_PROTOCOL=file`) and the shared
+repository cache disabled, `xcodebuild -resolvePackageDependencies` succeeded against a
+kept `SourcePackages` and failed against an empty one.
 
 One, the uv cache, is **pruned by --delete-safe** instead: every `uvx` run and new
 virtualenv installs out of it, so clearing it means re-downloading on the next one.
@@ -183,7 +191,8 @@ environments a running `uvx` tool may be executing from. `--delete` offers the c
 pruning it or deleting all of it.
 
 The other eighteen are tagged **review carefully** and `--delete-safe` never touches them,
-whatever `--except` says. Virtualenvs, framework build directories, DerivedData, simulators
+whatever `--except` says. Virtualenvs, framework build directories, the Swift packages
+DerivedData downloaded, simulators
 and their runtimes, iPhone backups, browser caches, the cloud mirror, the caches that cost
 hours to rebuild, `Windows.old`, the installer payload cache still needed to repair or
 uninstall, Docker and WSL data, the Android SDK and emulator images, and Claude Code's
@@ -323,7 +332,7 @@ Windows is not covered by that gate, so check it explicitly when touching `platf
 
     cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-Sixty-nine tests cover directory classification and the marker files it requires, the size
+Seventy-two tests cover directory classification and the marker files it requires, the size
 accounting including the sparse and hard-link cases, category slugs and their uniqueness,
 the deletion policy, and each refusal rule above. The rules that exist because something
 broke are pinned by a test naming the failure, so a future change that reintroduces the bug
@@ -345,7 +354,7 @@ it too, so a category cannot be reported without being deletable or the reverse.
 
 `Category` carries its own policy: `sweep()` for whether `--delete-safe` removes it, prunes
 it through its owning tool, or leaves it for review, together with the guard checked
-just before a folder goes; `delete_contents_only()` for whether the directory itself must
-survive; and `slug()` derived from the display label so the CLI name cannot drift from what
+just before a folder goes; `removal()` for whether a folder goes whole, is emptied because
+the OS expects it to exist, or keeps the packages inside it; and `slug()` derived from the display label so the CLI name cannot drift from what
 the report prints. `sweep()` names every category, so adding one means adding a variant, a
 label, a policy and a line in `SECTION_CATS`; the compiler finds the rest.
